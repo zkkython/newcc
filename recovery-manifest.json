@@ -1,0 +1,10 @@
+{
+  "generatedAt": "2026-03-31T15:27:42.207Z",
+  "totals": {
+    "sourceFilesScanned": 2061,
+    "unresolvedImportRefs": 0,
+    "unresolvedImportEdges": 0,
+    "unresolvedModuleCount": 0
+  },
+  "missingModules": []
+}

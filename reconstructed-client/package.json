@@ -1,0 +1,13 @@
+{
+  "name": "claude-client-reconstructed",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "claude-repro": "./claude-client.mjs"
+  },
+  "scripts": {
+    "start": "node ./claude-client.mjs",
+    "help": "node ./claude-client.mjs --help"
+  }
+}

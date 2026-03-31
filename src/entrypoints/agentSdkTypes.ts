@@ -13,6 +13,23 @@ import type {
   CallToolResult,
   ToolAnnotations,
 } from '@modelcontextprotocol/sdk/types.js'
+import { randomUUID } from 'crypto'
+import { appendFile, readFile, writeFile } from 'fs/promises'
+import { dirname, join } from 'path'
+import {
+  buildMissedTaskNotification as buildMissedTaskNotificationImpl,
+  createCronScheduler,
+} from '../utils/cronScheduler.js'
+import { parseJSONL } from '../utils/json.js'
+import {
+  listSessionsImpl,
+  parseSessionInfoFromLite,
+} from '../utils/listSessionsImpl.js'
+import {
+  readSessionLite,
+  resolveSessionFilePath,
+} from '../utils/sessionStoragePortable.js'
+import type { Entry } from '../types/logs.js'
 
 // Control protocol types for SDK builders (bridge subpath consumers)
 /** @alpha */
@@ -71,20 +88,26 @@ export type {
 }
 
 export function tool<Schema extends AnyZodRawShape>(
-  _name: string,
-  _description: string,
-  _inputSchema: Schema,
-  _handler: (
+  name: string,
+  description: string,
+  inputSchema: Schema,
+  handler: (
     args: InferShape<Schema>,
     extra: unknown,
   ) => Promise<CallToolResult>,
-  _extras?: {
+  extras?: {
     annotations?: ToolAnnotations
     searchHint?: string
     alwaysLoad?: boolean
   },
 ): SdkMcpToolDefinition<Schema> {
-  throw new Error('not implemented')
+  return {
+    name,
+    description,
+    inputSchema,
+    handler,
+    extras,
+  }
 }
 
 type CreateSdkMcpServerOptions = {
@@ -101,9 +124,17 @@ type CreateSdkMcpServerOptions = {
  * If your SDK MCP calls will run longer than 60s, override CLAUDE_CODE_STREAM_CLOSE_TIMEOUT
  */
 export function createSdkMcpServer(
-  _options: CreateSdkMcpServerOptions,
+  options: CreateSdkMcpServerOptions,
 ): McpSdkServerConfigWithInstance {
-  throw new Error('not implemented')
+  return {
+    type: 'sdk',
+    name: options.name,
+    instance: {
+      name: options.name,
+      version: options.version ?? '1.0.0',
+      tools: options.tools ?? [],
+    },
+  }
 }
 
 export class AbortError extends Error {}
@@ -117,8 +148,111 @@ export function query(_params: {
   prompt: string | AsyncIterable<SDKUserMessage>
   options?: Options
 }): Query
-export function query(): Query {
-  throw new Error('query is not implemented in the SDK')
+export function query(params?: {
+  prompt: string | AsyncIterable<SDKUserMessage>
+  options?: Options
+}): Query {
+  return (async function* () {
+    if (params?.prompt && typeof params.prompt !== 'string') {
+      for await (const userMsg of params.prompt) {
+        yield userMsg as SDKMessage
+      }
+    } else if (typeof params?.prompt === 'string') {
+      yield {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: params.prompt,
+        },
+        parent_tool_use_id: null,
+      } as SDKMessage
+    }
+    yield buildResultMessage(
+      'error_during_execution',
+      ['query() runtime is unavailable in this reconstructed SDK build'],
+    ) as SDKMessage
+  })()
+}
+
+function buildResultMessage(
+  subtype:
+    | 'success'
+    | 'error_during_execution'
+    | 'error_max_turns'
+    | 'error_max_budget_usd'
+    | 'error_max_structured_output_retries',
+  errors?: string[],
+): SDKResultMessage {
+  const base = {
+    type: 'result' as const,
+    duration_ms: 0,
+    duration_api_ms: 0,
+    is_error: subtype !== 'success',
+    num_turns: 0,
+    stop_reason: null,
+    total_cost_usd: 0,
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      service_tier: 'standard' as const,
+    },
+    modelUsage: {},
+    permission_denials: [],
+    uuid: randomUUID(),
+    session_id: randomUUID(),
+  }
+  if (subtype === 'success') {
+    return {
+      ...base,
+      subtype,
+      result: '',
+    }
+  }
+  return {
+    ...base,
+    subtype,
+    errors: errors ?? ['Unknown error'],
+  }
+}
+
+function createSessionObject(
+  sessionId: string,
+  options: SDKSessionOptions,
+): SDKSession {
+  return {
+    id: sessionId,
+    query(params: { prompt: string }): Query {
+      return query({
+        prompt: params.prompt,
+        options: options.options ?? {},
+      })
+    },
+    async prompt(message: string): Promise<SDKResultMessage> {
+      let last: SDKResultMessage | null = null
+      for await (const msg of query({
+        prompt: message,
+        options: options.options ?? {},
+      })) {
+        if (msg.type === 'result') {
+          last = msg as SDKResultMessage
+        }
+      }
+      return last ?? buildResultMessage('error_during_execution', ['No result'])
+    },
+    getInfo(opts?: GetSessionInfoOptions): Promise<SDKSessionInfo | undefined> {
+      return getSessionInfo(sessionId, opts)
+    },
+    getMessages(
+      opts?: GetSessionMessagesOptions,
+    ): Promise<SessionMessage[]> {
+      return getSessionMessages(sessionId, opts)
+    },
+    fork(options?: ForkSessionOptions): Promise<ForkSessionResult> {
+      return forkSession(sessionId, options)
+    },
+  }
 }
 
 /**
@@ -127,9 +261,9 @@ export function query(): Query {
  * @alpha
  */
 export function unstable_v2_createSession(
-  _options: SDKSessionOptions,
+  options: SDKSessionOptions,
 ): SDKSession {
-  throw new Error('unstable_v2_createSession is not implemented in the SDK')
+  return createSessionObject(randomUUID(), options)
 }
 
 /**
@@ -138,10 +272,10 @@ export function unstable_v2_createSession(
  * @alpha
  */
 export function unstable_v2_resumeSession(
-  _sessionId: string,
-  _options: SDKSessionOptions,
+  sessionId: string,
+  options: SDKSessionOptions,
 ): SDKSession {
-  throw new Error('unstable_v2_resumeSession is not implemented in the SDK')
+  return createSessionObject(sessionId, options)
 }
 
 // @[MODEL LAUNCH]: Update the example model ID in this docstring.
@@ -158,10 +292,10 @@ export function unstable_v2_resumeSession(
  * ```
  */
 export async function unstable_v2_prompt(
-  _message: string,
-  _options: SDKSessionOptions,
+  message: string,
+  options: SDKSessionOptions,
 ): Promise<SDKResultMessage> {
-  throw new Error('unstable_v2_prompt is not implemented in the SDK')
+  return createSessionObject(randomUUID(), options).prompt(message)
 }
 
 /**
@@ -176,10 +310,65 @@ export async function unstable_v2_prompt(
  * @returns Array of messages, or empty array if session not found
  */
 export async function getSessionMessages(
-  _sessionId: string,
-  _options?: GetSessionMessagesOptions,
+  sessionId: string,
+  options?: GetSessionMessagesOptions,
 ): Promise<SessionMessage[]> {
-  throw new Error('getSessionMessages is not implemented in the SDK')
+  const resolved = await resolveSessionFilePath(sessionId, options?.dir)
+  if (!resolved) return []
+
+  const content = await readFile(resolved.filePath, 'utf8').catch(() => '')
+  if (!content) return []
+
+  const allEntries = parseJSONL<Entry>(content)
+  const transcript = allEntries.filter(
+    (entry): entry is Entry & { uuid: string; parentUuid: string | null } =>
+      typeof entry === 'object' &&
+      entry !== null &&
+      'uuid' in entry &&
+      'parentUuid' in entry &&
+      (entry as { isSidechain?: boolean }).isSidechain !== true,
+  )
+  if (transcript.length === 0) return []
+
+  const byUuid = new Map(
+    transcript
+      .map(m => [m.uuid, m] as const)
+      .filter(([uuid]) => typeof uuid === 'string'),
+  )
+  const leaf = transcript.reduce((latest, cur) => {
+    const latestTs = Date.parse((latest as { timestamp?: string }).timestamp ?? '')
+    const curTs = Date.parse((cur as { timestamp?: string }).timestamp ?? '')
+    if (!Number.isNaN(curTs) && (Number.isNaN(latestTs) || curTs > latestTs)) {
+      return cur
+    }
+    return latest
+  }, transcript[transcript.length - 1]!)
+
+  const chain: SessionMessage[] = []
+  const seen = new Set<string>()
+  let cur: (typeof transcript)[number] | undefined = leaf
+  while (cur && !seen.has(cur.uuid)) {
+    seen.add(cur.uuid)
+    const type = (cur as { type?: string }).type
+    if (
+      type === 'user' ||
+      type === 'assistant' ||
+      (options?.includeSystemMessages && type === 'system')
+    ) {
+      chain.push({
+        ...(cur as Record<string, unknown>),
+        session_id: (cur as { sessionId?: string }).sessionId ?? sessionId,
+      } as SessionMessage)
+    }
+    const parentUuid = (cur as { parentUuid?: string | null }).parentUuid
+    cur =
+      typeof parentUuid === 'string' ? byUuid.get(parentUuid) : undefined
+  }
+
+  chain.reverse()
+  const offset = Math.max(0, options?.offset ?? 0)
+  const limit = options?.limit && options.limit > 0 ? options.limit : undefined
+  return limit ? chain.slice(offset, offset + limit) : chain.slice(offset)
 }
 
 /**
@@ -202,9 +391,9 @@ export async function getSessionMessages(
  * ```
  */
 export async function listSessions(
-  _options?: ListSessionsOptions,
+  options?: ListSessionsOptions,
 ): Promise<SDKSessionInfo[]> {
-  throw new Error('listSessions is not implemented in the SDK')
+  return (await listSessionsImpl(options)) as SDKSessionInfo[]
 }
 
 /**
@@ -217,10 +406,16 @@ export async function listSessions(
  * @param options - `{ dir?: string }` project path; omit to search all project directories
  */
 export async function getSessionInfo(
-  _sessionId: string,
-  _options?: GetSessionInfoOptions,
+  sessionId: string,
+  options?: GetSessionInfoOptions,
 ): Promise<SDKSessionInfo | undefined> {
-  throw new Error('getSessionInfo is not implemented in the SDK')
+  const resolved = await resolveSessionFilePath(sessionId, options?.dir)
+  if (!resolved) return undefined
+  const lite = await readSessionLite(resolved.filePath)
+  if (!lite) return undefined
+  return (
+    parseSessionInfoFromLite(sessionId, lite, resolved.projectPath) ?? undefined
+  ) as SDKSessionInfo | undefined
 }
 
 /**
@@ -230,11 +425,19 @@ export async function getSessionInfo(
  * @param options - `{ dir?: string }` project path; omit to search all projects
  */
 export async function renameSession(
-  _sessionId: string,
-  _title: string,
+  sessionId: string,
+  title: string,
   _options?: SessionMutationOptions,
 ): Promise<void> {
-  throw new Error('renameSession is not implemented in the SDK')
+  const resolved = await resolveSessionFilePath(sessionId)
+  if (!resolved) {
+    throw new Error(`Session not found: ${sessionId}`)
+  }
+  await appendJsonlEntry(resolved.filePath, {
+    type: 'custom-title',
+    sessionId,
+    customTitle: title,
+  })
 }
 
 /**
@@ -244,11 +447,19 @@ export async function renameSession(
  * @param options - `{ dir?: string }` project path; omit to search all projects
  */
 export async function tagSession(
-  _sessionId: string,
-  _tag: string | null,
+  sessionId: string,
+  tag: string | null,
   _options?: SessionMutationOptions,
 ): Promise<void> {
-  throw new Error('tagSession is not implemented in the SDK')
+  const resolved = await resolveSessionFilePath(sessionId)
+  if (!resolved) {
+    throw new Error(`Session not found: ${sessionId}`)
+  }
+  await appendJsonlEntry(resolved.filePath, {
+    type: 'tag',
+    sessionId,
+    tag: tag ?? '',
+  })
 }
 
 /**
@@ -266,10 +477,72 @@ export async function tagSession(
  * @returns `{ sessionId }` — UUID of the new forked session
  */
 export async function forkSession(
-  _sessionId: string,
-  _options?: ForkSessionOptions,
+  sessionId: string,
+  options?: ForkSessionOptions,
 ): Promise<ForkSessionResult> {
-  throw new Error('forkSession is not implemented in the SDK')
+  const resolved = await resolveSessionFilePath(sessionId)
+  if (!resolved) {
+    throw new Error(`Session not found: ${sessionId}`)
+  }
+
+  const original = await readFile(resolved.filePath, 'utf8')
+  const entries = parseJSONL<Entry>(original)
+  const forkSessionId = randomUUID()
+  const uuidMap = new Map<string, string>()
+
+  const translated = entries.map(entry => {
+    if (
+      typeof entry === 'object' &&
+      entry !== null &&
+      'uuid' in entry &&
+      typeof (entry as { uuid?: unknown }).uuid === 'string'
+    ) {
+      const current = entry as Record<string, unknown>
+      const oldUuid = current.uuid as string
+      const newUuid = uuidMap.get(oldUuid) ?? randomUUID()
+      uuidMap.set(oldUuid, newUuid)
+      const parent = current.parentUuid
+      return {
+        ...current,
+        uuid: newUuid,
+        parentUuid:
+          typeof parent === 'string' ? (uuidMap.get(parent) ?? null) : null,
+        sessionId: forkSessionId,
+        isSidechain: false,
+        forkedFrom: { sessionId, messageUuid: oldUuid },
+      }
+    }
+    if (
+      typeof entry === 'object' &&
+      entry !== null &&
+      'sessionId' in entry
+    ) {
+      return {
+        ...(entry as Record<string, unknown>),
+        sessionId: forkSessionId,
+      }
+    }
+    return entry
+  })
+
+  const outputPath = join(dirname(resolved.filePath), `${forkSessionId}.jsonl`)
+  const data =
+    translated
+      .map(item => JSON.stringify(item))
+      .join('\n')
+      .concat('\n')
+  await writeFile(outputPath, data, { encoding: 'utf8', mode: 0o600 })
+
+  const requestedTitle = (options?.options as { title?: unknown } | undefined)
+    ?.title
+  if (typeof requestedTitle === 'string' && requestedTitle.trim().length > 0) {
+    await appendJsonlEntry(outputPath, {
+      type: 'custom-title',
+      sessionId: forkSessionId,
+      customTitle: requestedTitle,
+    })
+  }
+  return { sessionId: forkSessionId }
 }
 
 // ============================================================================
@@ -352,7 +625,58 @@ export function watchScheduledTasks(_opts: {
   signal: AbortSignal
   getJitterConfig?: () => CronJitterConfig
 }): ScheduledTasksHandle {
-  throw new Error('not implemented')
+  const queue: ScheduledTaskEvent[] = []
+  const waiters: Array<(event: ScheduledTaskEvent | null) => void> = []
+  let closed = false
+
+  const pushEvent = (event: ScheduledTaskEvent) => {
+    if (closed) return
+    const waiter = waiters.shift()
+    if (waiter) waiter(event)
+    else queue.push(event)
+  }
+
+  const scheduler = createCronScheduler({
+    dir: _opts.dir,
+    lockIdentity: randomUUID(),
+    isLoading: () => false,
+    getJitterConfig: _opts.getJitterConfig,
+    onFire: () => undefined,
+    onFireTask: task => pushEvent({ type: 'fire', task }),
+    onMissed: tasks => pushEvent({ type: 'missed', tasks }),
+  })
+  scheduler.start()
+
+  const close = () => {
+    if (closed) return
+    closed = true
+    scheduler.stop()
+    while (waiters.length > 0) {
+      waiters.shift()?.(null)
+    }
+  }
+  _opts.signal.addEventListener('abort', close, { once: true })
+
+  return {
+    async *events() {
+      while (true) {
+        if (queue.length > 0) {
+          const next = queue.shift()!
+          yield next
+          continue
+        }
+        if (closed) break
+        const next = await new Promise<ScheduledTaskEvent | null>(resolve =>
+          waiters.push(resolve),
+        )
+        if (!next) break
+        yield next
+      }
+    },
+    getNextFireTime() {
+      return scheduler.getNextFireTime()
+    },
+  }
 }
 
 /**
@@ -360,8 +684,8 @@ export function watchScheduledTasks(_opts: {
  * with the user (via AskUserQuestion) before executing.
  * @internal
  */
-export function buildMissedTaskNotification(_missed: CronTask[]): string {
-  throw new Error('not implemented')
+export function buildMissedTaskNotification(missed: CronTask[]): string {
+  return buildMissedTaskNotificationImpl(missed)
 }
 
 /**
@@ -439,5 +763,13 @@ export type RemoteControlHandle = {
 export async function connectRemoteControl(
   _opts: ConnectRemoteControlOptions,
 ): Promise<RemoteControlHandle | null> {
-  throw new Error('not implemented')
+  return null
+}
+
+async function appendJsonlEntry(
+  filePath: string,
+  entry: Record<string, unknown>,
+): Promise<void> {
+  const line = JSON.stringify(entry)
+  await appendFile(filePath, `${line}\n`, { encoding: 'utf8', mode: 0o600 })
 }
