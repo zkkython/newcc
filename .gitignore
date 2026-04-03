@@ -1,2 +1,31 @@
 node_modules/
 
+# Local temp/runtime data
+.tmp/
+tmp/
+*.log
+*.pid
+
+# Environment/local config
+.env
+.env.*
+!.env.example
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Build/test artifacts
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Local images and debug captures
+images/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.lock
