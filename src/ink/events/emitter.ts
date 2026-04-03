@@ -1,5 +1,6 @@
 import { EventEmitter as NodeEventEmitter } from 'events'
 import { Event } from './event.js'
+import { logError } from '../../utils/log.js'
 
 // Similar to node's builtin EventEmitter, but is also aware of our `Event`
 // class, and so `emit` respects `stopImmediatePropagation()`.
@@ -27,7 +28,13 @@ export class EventEmitter extends NodeEventEmitter {
     const ccEvent = args[0] instanceof Event ? args[0] : null
 
     for (const listener of listeners) {
-      listener.apply(this, args)
+      try {
+        listener.apply(this, args)
+      } catch (error) {
+        // Keep input/event fan-out resilient: one buggy listener should not
+        // break all downstream handlers (e.g., prompt submit on Enter).
+        logError(error as Error)
+      }
 
       if (ccEvent?.didStopImmediatePropagation()) {
         break

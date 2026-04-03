@@ -639,6 +639,27 @@ export function REPL({
   const viewingAgentTaskId = useAppState(s => s.viewingAgentTaskId);
   const setAppState = useSetAppState();
 
+  // Defensive reset: setup dialogs (Trust/Onboarding/etc.) run before REPL and
+  // can leave stale overlay/navigation state under some runtimes. If that
+  // happens, PromptInput focus stays false and Enter never reaches submission.
+  useEffect(() => {
+    setAppState(prev => {
+      const hasStaleOverlayState = prev.activeOverlays.size > 0;
+      const hasStaleFooterState = prev.footerSelection !== null;
+      const hasStaleSelectionMode = prev.viewSelectionMode !== 'none';
+      if (!hasStaleOverlayState && !hasStaleFooterState && !hasStaleSelectionMode) {
+        return prev;
+      }
+      logForDebugging(`[REPL:mount] clearing stale UI state: overlays=${prev.activeOverlays.size}, footerSelection=${prev.footerSelection ?? 'null'}, viewSelectionMode=${prev.viewSelectionMode}`);
+      return {
+        ...prev,
+        activeOverlays: new Set<string>(),
+        footerSelection: null,
+        viewSelectionMode: 'none'
+      };
+    });
+  }, [setAppState]);
+
   // Bootstrap: retained local_agent that hasn't loaded disk yet → read
   // sidechain JSONL and UUID-merge with whatever stream has appended so far.
   // Stream appends immediately on retain (no defer); bootstrap fills the

@@ -85,6 +85,7 @@ type Props = {
   // Dispatch a keyboard event through the DOM tree. Called for each
   // parsed key alongside the legacy EventEmitter path.
   readonly dispatchKeyboardEvent: (parsedKey: ParsedKey) => void;
+  readonly minimalTerminalModes: boolean;
 };
 
 // Multi-click detection thresholds. 500ms is the macOS default; a small
@@ -229,37 +230,39 @@ export default class App extends PureComponent<Props, State> {
         stdin.ref();
         stdin.setRawMode(true);
         stdin.addListener('readable', this.handleReadable);
-        // Enable bracketed paste mode
-        this.props.stdout.write(EBP);
-        // Enable terminal focus reporting (DECSET 1004)
-        this.props.stdout.write(EFE);
-        // Enable extended key reporting so ctrl+shift+<letter> is
-        // distinguishable from ctrl+<letter>. We write both the kitty stack
-        // push (CSI >1u) and xterm modifyOtherKeys level 2 (CSI >4;2m) —
-        // terminals honor whichever they implement (tmux only accepts the
-        // latter).
-        if (supportsExtendedKeys()) {
-          this.props.stdout.write(ENABLE_KITTY_KEYBOARD);
-          this.props.stdout.write(ENABLE_MODIFY_OTHER_KEYS);
-        }
-        // Probe terminal identity. XTVERSION survives SSH (query/reply goes
-        // through the pty), unlike TERM_PROGRAM. Used for wheel-scroll base
-        // detection when env vars are absent. Fire-and-forget: the DA1
-        // sentinel bounds the round-trip, and if the terminal ignores the
-        // query, flush() still resolves and name stays undefined.
-        // Deferred to next tick so it fires AFTER the current synchronous
-        // init sequence completes — avoids interleaving with alt-screen/mouse
-        // tracking enable writes that may happen in the same render cycle.
-        setImmediate(() => {
-          void Promise.all([this.querier.send(xtversion()), this.querier.flush()]).then(([r]) => {
-            if (r) {
-              setXtversionName(r.name);
-              logForDebugging(`XTVERSION: terminal identified as "${r.name}"`);
-            } else {
-              logForDebugging('XTVERSION: no reply (terminal ignored query)');
-            }
+        if (!this.props.minimalTerminalModes) {
+          // Enable bracketed paste mode
+          this.props.stdout.write(EBP);
+          // Enable terminal focus reporting (DECSET 1004)
+          this.props.stdout.write(EFE);
+          // Enable extended key reporting so ctrl+shift+<letter> is
+          // distinguishable from ctrl+<letter>. We write both the kitty stack
+          // push (CSI >1u) and xterm modifyOtherKeys level 2 (CSI >4;2m) —
+          // terminals honor whichever they implement (tmux only accepts the
+          // latter).
+          if (supportsExtendedKeys()) {
+            this.props.stdout.write(ENABLE_KITTY_KEYBOARD);
+            this.props.stdout.write(ENABLE_MODIFY_OTHER_KEYS);
+          }
+          // Probe terminal identity. XTVERSION survives SSH (query/reply goes
+          // through the pty), unlike TERM_PROGRAM. Used for wheel-scroll base
+          // detection when env vars are absent. Fire-and-forget: the DA1
+          // sentinel bounds the round-trip, and if the terminal ignores the
+          // query, flush() still resolves and name stays undefined.
+          // Deferred to next tick so it fires AFTER the current synchronous
+          // init sequence completes — avoids interleaving with alt-screen/mouse
+          // tracking enable writes that may happen in the same render cycle.
+          setImmediate(() => {
+            void Promise.all([this.querier.send(xtversion()), this.querier.flush()]).then(([r]) => {
+              if (r) {
+                setXtversionName(r.name);
+                logForDebugging(`XTVERSION: terminal identified as "${r.name}"`);
+              } else {
+                logForDebugging('XTVERSION: no reply (terminal ignored query)');
+              }
+            });
           });
-        });
+        }
       }
       this.rawModeEnabledCount++;
       return;
@@ -267,12 +270,14 @@ export default class App extends PureComponent<Props, State> {
 
     // Disable raw mode only when no components left that are using it
     if (--this.rawModeEnabledCount === 0) {
-      this.props.stdout.write(DISABLE_MODIFY_OTHER_KEYS);
-      this.props.stdout.write(DISABLE_KITTY_KEYBOARD);
-      // Disable terminal focus reporting (DECSET 1004)
-      this.props.stdout.write(DFE);
-      // Disable bracketed paste mode
-      this.props.stdout.write(DBP);
+      if (!this.props.minimalTerminalModes) {
+        this.props.stdout.write(DISABLE_MODIFY_OTHER_KEYS);
+        this.props.stdout.write(DISABLE_KITTY_KEYBOARD);
+        // Disable terminal focus reporting (DECSET 1004)
+        this.props.stdout.write(DFE);
+        // Disable bracketed paste mode
+        this.props.stdout.write(DBP);
+      }
       stdin.setRawMode(false);
       stdin.removeListener('readable', this.handleReadable);
       stdin.unref();
@@ -426,8 +431,10 @@ export default class App extends PureComponent<Props, State> {
         if (!isEnvTruthy(process.env.CLAUDE_CODE_ACCESSIBILITY)) {
           this.props.stdout.write(HIDE_CURSOR);
         }
-        // Re-enable focus reporting to restore terminal state
-        this.props.stdout.write(EFE);
+        if (!this.props.minimalTerminalModes) {
+          // Re-enable focus reporting to restore terminal state
+          this.props.stdout.write(EFE);
+        }
       }
 
       // Emit resume event for Claude Code to handle

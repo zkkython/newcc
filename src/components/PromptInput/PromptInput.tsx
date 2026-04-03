@@ -367,6 +367,9 @@ function PromptInput({
   if (nextPasteIdRef.current === -1) {
     nextPasteIdRef.current = getInitialPasteId(messages);
   }
+  // Incremented on every onSubmit invocation. Used by Enter fallback logic to
+  // detect whether TextInput already handled submit in the same event turn.
+  const submitInvocationCounterRef = useRef(0);
   // Armed by onImagePaste; if the very next keystroke is a non-space
   // printable, inputFilter prepends a space before it. Any other input
   // (arrow, escape, backspace, paste, space) disarms without inserting.
@@ -983,6 +986,8 @@ function PromptInput({
   }, []);
   const onSubmit = useCallback(async (inputParam: string, isSubmittingSlashCommand = false) => {
     inputParam = inputParam.trimEnd();
+    submitInvocationCounterRef.current += 1;
+    logForDebugging(`[PromptInput:onSubmit] invoked len=${inputParam.length} slash=${isSubmittingSlashCommand}`);
 
     // Don't submit if a footer indicator is being opened. Read fresh from
     // store — footer:openSelected calls selectFooterItem(null) then onSubmit
@@ -991,18 +996,19 @@ function PromptInput({
     // selection (pill disappeared) doesn't swallow Enter.
     const state = store.getState();
     if (state.footerSelection && footerItems.includes(state.footerSelection)) {
-      return;
-    }
-
-    // Enter in selection modes confirms selection (useBackgroundTaskNavigation).
-    // BaseTextInput's useInput registers before that hook (child effects fire first),
-    // so without this guard Enter would double-fire and auto-submit the suggestion.
-    if (state.viewSelectionMode === 'selecting-agent') {
+      logForDebugging('[PromptInput:onSubmit] blocked by footerSelection');
       return;
     }
 
     // Check for images early - we need this for suggestion logic below
     const hasImages = Object.values(pastedContents).some(c => c.type === 'image');
+
+    // Enter in selection modes confirms selection (useBackgroundTaskNavigation).
+    // Keep that behavior only when nothing is typed; otherwise allow prompt submit.
+    if (state.viewSelectionMode === 'selecting-agent' && inputParam.trim() === '' && !hasImages) {
+      logForDebugging('[PromptInput:onSubmit] blocked by selecting-agent mode (empty input)');
+      return;
+    }
 
     // If input is empty OR matches the suggestion, submit it
     // But if there are images attached, don't auto-accept the suggestion -
@@ -1065,6 +1071,7 @@ function PromptInput({
 
     // Allow submission if there are images attached, even without text
     if (inputParam.trim() === '' && !hasImages) {
+      logForDebugging('[PromptInput:onSubmit] blocked empty input with no images');
       return;
     }
 
@@ -1781,6 +1788,13 @@ function PromptInput({
       navigateFooter(-1);
     },
     'footer:openSelected': () => {
+      // If there's typed input, Enter should submit the prompt instead of
+      // being consumed by footer selection state.
+      if (input.trim().length > 0) {
+        selectFooterItem(null);
+        void onSubmit(input);
+        return;
+      }
       if (viewSelectionMode === 'selecting-agent') {
         return;
       }
@@ -1870,6 +1884,29 @@ function PromptInput({
       return;
     }
 
+    if (key.return) {
+      logForDebugging(
+        `[PromptInput:enter] inputLen=${input.trim().length} focus=${!isSearchingHistory && !isModalOverlayActive && !footerItemSelected} footer=${String(footerItemSelected)} viewMode=${store.getState().viewSelectionMode ?? 'none'}`,
+      );
+      // Fallback: in some terminal/input states Enter reaches PromptInput but
+      // does not reach TextInput's submit path. Schedule a microtask fallback
+      // and only submit if no onSubmit happened in this event turn.
+      if (
+        input.trim().length > 0 &&
+        !footerItemSelected &&
+        viewSelectionMode !== 'selecting-agent' &&
+        !helpOpen
+      ) {
+        const submitCounterBefore = submitInvocationCounterRef.current;
+        queueMicrotask(() => {
+          if (submitInvocationCounterRef.current === submitCounterBefore) {
+            logForDebugging('[PromptInput:enter] fallback submit path triggered');
+            void onSubmit(input);
+          }
+        });
+      }
+    }
+
     // Detect failed Alt shortcuts on macOS (Option key produces special characters)
     if (getPlatform() === 'macos' && isMacosOptionChar(char)) {
       const shortcut = MACOS_OPTION_SPECIAL_CHARS[char];
@@ -1888,6 +1925,14 @@ function PromptInput({
     }
 
     // Footer navigation is handled via useKeybindings above (Footer context)
+
+    // Fallback: if Enter is pressed while input has text and we're in a
+    // selection/footer state, force prompt submission instead of swallowing it.
+    if (key.return && input.trim().length > 0 && (footerItemSelected || viewSelectionMode === 'selecting-agent')) {
+      selectFooterItem(null);
+      void onSubmit(input);
+      return;
+    }
 
     // NOTE: ctrl+_, ctrl+g, ctrl+s are handled via Chat context keybindings above
 

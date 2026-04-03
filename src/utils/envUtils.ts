@@ -1,14 +1,40 @@
 import memoize from 'lodash-es/memoize.js'
-import { homedir } from 'os'
+import { accessSync, constants as fsConstants, mkdirSync } from 'fs'
+import { homedir, tmpdir } from 'os'
 import { join } from 'path'
+
+function isWritableDir(dir: string): boolean {
+  try {
+    mkdirSync(dir, { recursive: true })
+    accessSync(dir, fsConstants.R_OK | fsConstants.W_OK)
+    return true
+  } catch {
+    return false
+  }
+}
 
 // Memoized: 150+ callers, many on hot paths. Keyed off CLAUDE_CONFIG_DIR so
 // tests that change the env var get a fresh value without explicit cache.clear.
 export const getClaudeConfigHomeDir = memoize(
   (): string => {
-    return (
-      process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude')
-    ).normalize('NFC')
+    const configured = process.env.CLAUDE_CONFIG_DIR
+    if (configured) {
+      return configured.normalize('NFC')
+    }
+
+    const defaultDir = join(homedir(), '.claude')
+    if (isWritableDir(defaultDir)) {
+      return defaultDir.normalize('NFC')
+    }
+
+    // Fallback prevents startup dead-ends when ~/.claude is not writable.
+    const uid =
+      typeof process.getuid === 'function'
+        ? String(process.getuid())
+        : process.env.USER || 'default'
+    const fallbackDir = join(tmpdir(), 'claude-code', uid)
+    mkdirSync(fallbackDir, { recursive: true })
+    return fallbackDir.normalize('NFC')
   },
   () => process.env.CLAUDE_CONFIG_DIR,
 )

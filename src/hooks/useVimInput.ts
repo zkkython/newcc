@@ -200,8 +200,15 @@ export function useVimInput(props: UseVimInputProps): VimInputState {
       return
     }
 
-    // Pass Enter to base handler regardless of mode (allows submission from NORMAL)
-    if (key.return) {
+    // Pass Enter to base handler regardless of mode (allows submission from
+    // NORMAL). Some terminals/runtimes report Enter as raw "\r"/"\n" without
+    // setting key.return.
+    if (
+      key.return ||
+      (!key.ctrl &&
+        rawInput.length === 1 &&
+        (rawInput === '\r' || rawInput === '\n'))
+    ) {
       textInput.onInput(input, key)
       return
     }

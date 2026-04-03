@@ -5,7 +5,7 @@ import { logEvent } from 'src/services/analytics/index.js';
 import { setSessionTrustAccepted } from '../../bootstrap/state.js';
 import type { Command } from '../../commands.js';
 import { useExitOnCtrlCDWithKeybindings } from '../../hooks/useExitOnCtrlCDWithKeybindings.js';
-import { Box, Link, Text } from '../../ink.js';
+import { Box, Link, Text, useInput } from '../../ink.js';
 import { useKeybinding } from '../../keybindings/useKeybinding.js';
 import { getMcpConfigsByScope } from '../../services/mcp/config.js';
 import { BASH_TOOL_NAME } from '../../tools/BashTool/toolName.js';
@@ -195,7 +195,36 @@ export function TrustDialog(t0) {
   } else {
     t15 = $[19];
   }
+  useKeybinding("confirm:yes", () => {
+    onChange("enable_all");
+  }, t15);
   useKeybinding("confirm:no", _temp7, t15);
+  useKeybinding("select:accept", () => {
+    onChange("enable_all");
+  }, {
+    context: "Select"
+  });
+  useKeybinding("select:cancel", () => {
+    onChange("exit");
+  }, {
+    context: "Select"
+  });
+  useInput((input, key, event) => {
+    // Fallbacks for terminals/runtimes where the Select keybinding layer
+    // misses Enter on the first trust screen.
+    const normalizedInput = input.toLowerCase();
+    const keypressName = event?.keypress?.name;
+    const isEnter = key.return || keypressName === "return" || keypressName === "enter" || (key.ctrl && input === "m");
+    if (isEnter || input === "\r" || input === "\n" || input === "1" || normalizedInput === "y") {
+      event?.stopImmediatePropagation?.();
+      onChange("enable_all");
+      return;
+    }
+    if (input === "2" || normalizedInput === "n") {
+      event?.stopImmediatePropagation?.();
+      onChange("exit");
+    }
+  });
   if (hasTrustDialogAccepted) {
     setTimeout(onDone);
     return null;

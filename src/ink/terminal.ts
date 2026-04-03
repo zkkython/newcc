@@ -83,7 +83,6 @@ export function isSynchronizedOutputSupported(): boolean {
     termProgram === 'WarpTerminal' ||
     termProgram === 'ghostty' ||
     termProgram === 'contour' ||
-    termProgram === 'vscode' ||
     termProgram === 'alacritty'
   ) {
     return true

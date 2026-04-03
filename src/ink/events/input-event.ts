@@ -1,5 +1,6 @@
 import { nonAlphanumericKeys, type ParsedKey } from '../parse-keypress.js'
 import { Event } from './event.js'
+import { logForDebugging } from '../../utils/debug.js'
 
 export type Key = {
   upArrow: boolean
@@ -36,7 +37,9 @@ function parseKey(keypress: ParsedKey): [Key, string] {
     wheelDown: keypress.name === 'wheeldown',
     home: keypress.name === 'home',
     end: keypress.name === 'end',
-    return: keypress.name === 'return',
+    // Some terminals/runtimes report Enter as "enter" (e.g. keypad enter,
+    // certain Bun/TTY combinations) instead of "return".
+    return: keypress.name === 'return' || keypress.name === 'enter',
     escape: keypress.name === 'escape',
     fn: keypress.fn,
     ctrl: keypress.ctrl,
@@ -197,6 +200,14 @@ export class InputEvent extends Event {
   constructor(keypress: ParsedKey) {
     super()
     const [key, input] = parseKey(keypress)
+
+    if (key.return || input === '\r' || input === '\n') {
+      logForDebugging(
+        `[input-event] enter parsed: name=${keypress.name ?? ''} sequence=${JSON.stringify(
+          keypress.sequence,
+        )} input=${JSON.stringify(input)} ctrl=${key.ctrl} meta=${key.meta} shift=${key.shift}`,
+      )
+    }
 
     this.keypress = keypress
     this.key = key

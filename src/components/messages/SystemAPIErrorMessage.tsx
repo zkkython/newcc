@@ -24,7 +24,8 @@ export function SystemAPIErrorMessage(t0) {
     retryInMs,
     maxRetries
   } = t1;
-  const hidden = true && retryAttempt < 4;
+  // Show API connectivity errors immediately to avoid a "frozen" prompt feeling.
+  const hidden = false;
   const [countdownMs, setCountdownMs] = useState(0);
   const done = countdownMs >= retryInMs;
   let t2;

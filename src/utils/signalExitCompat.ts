@@ -1,4 +1,4 @@
-import signalExitModule from 'signal-exit'
+import * as signalExitModule from 'signal-exit'
 
 type OnExit = (
   cb: (code: number | null, signal: NodeJS.Signals | null) => void,

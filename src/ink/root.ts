@@ -41,6 +41,13 @@ export type RenderOptions = {
    * Called after each frame render with timing and flicker information.
    */
   onFrame?: (event: FrameEvent) => void
+
+  /**
+   * Setup/onboarding-safe terminal mode. Keeps raw input but skips startup
+   * terminal probes and optional terminal features that are more likely to
+   * trigger compatibility issues on some terminals.
+   */
+  minimalTerminalModes?: boolean
 }
 
 export type Instance = {
@@ -133,6 +140,7 @@ export async function createRoot({
   exitOnCtrlC = true,
   patchConsole = true,
   onFrame,
+  minimalTerminalModes = false,
 }: RenderOptions = {}): Promise<Root> {
   // See wrappedRender — preserve microtask boundary from the old WASM await.
   await Promise.resolve()
@@ -143,6 +151,7 @@ export async function createRoot({
     exitOnCtrlC,
     patchConsole,
     onFrame,
+    minimalTerminalModes,
   })
 
   // Register in the instances map so that code that looks up the Ink

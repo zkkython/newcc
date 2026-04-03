@@ -101,16 +101,32 @@ export async function renderAndRun(root: Root, element: React.ReactNode): Promis
   await root.waitUntilExit();
   await gracefulShutdown(0);
 }
-export async function showSetupScreens(root: Root, permissionMode: PermissionMode, allowDangerouslySkipPermissions: boolean, commands?: Command[], claudeInChrome?: boolean, devChannels?: ChannelEntry[]): Promise<boolean> {
+export type SetupScreensResult = {
+  onboardingShown: boolean;
+  anyScreenShown: boolean;
+};
+export async function showSetupScreens(root: Root, permissionMode: PermissionMode, allowDangerouslySkipPermissions: boolean, commands?: Command[], claudeInChrome?: boolean, devChannels?: ChannelEntry[]): Promise<SetupScreensResult> {
+  if (isEnvTruthy(process.env.CLAUDE_CODE_SKIP_SETUP_SCREENS)) {
+    setSessionTrustAccepted(true);
+    return {
+      onboardingShown: false,
+      anyScreenShown: false
+    };
+  }
   if ("production" === 'test' || isEnvTruthy(false) || process.env.IS_DEMO // Skip onboarding in demo mode
   ) {
-    return false;
+    return {
+      onboardingShown: false,
+      anyScreenShown: false
+    };
   }
   const config = getGlobalConfig();
   let onboardingShown = false;
+  let anyScreenShown = false;
   if (!config.theme || !config.hasCompletedOnboarding // always show onboarding at least once
   ) {
     onboardingShown = true;
+    anyScreenShown = true;
     const {
       Onboarding
     } = await import('./components/Onboarding.js');
@@ -133,6 +149,7 @@ export async function showSetupScreens(root: Root, permissionMode: PermissionMod
     // If it returns true, the TrustDialog would auto-resolve regardless of
     // security features, so we can skip the dynamic import and render cycle.
     if (!checkHasTrustDialogAccepted()) {
+      anyScreenShown = true;
       const {
         TrustDialog
       } = await import('./components/TrustDialog/TrustDialog.js');
@@ -162,6 +179,7 @@ export async function showSetupScreens(root: Root, permissionMode: PermissionMod
 
     // Check for claude.md includes that need approval
     if (await shouldShowClaudeMdExternalIncludesWarning()) {
+      anyScreenShown = true;
       const externalIncludes = getExternalClaudeMdIncludes(await getMemoryFiles(true));
       const {
         ClaudeMdExternalIncludesDialog
@@ -189,6 +207,7 @@ export async function showSetupScreens(root: Root, permissionMode: PermissionMod
   // instead of during the pre-render microtask queue.
   setImmediate(() => initializeTelemetryAfterTrust());
   if (await isQualifiedForGrove()) {
+    anyScreenShown = true;
     const {
       GroveDialog
     } = await import('src/components/grove/Grove.js');
@@ -210,6 +229,7 @@ export async function showSetupScreens(root: Root, permissionMode: PermissionMod
       const {
         ApproveApiKey
       } = await import('./components/ApproveApiKey.js');
+      anyScreenShown = true;
       await showSetupDialog<boolean>(root, done => <ApproveApiKey customApiKeyTruncated={customApiKeyTruncated} onDone={done} />, {
         onChangeAppState
       });
@@ -219,6 +239,7 @@ export async function showSetupScreens(root: Root, permissionMode: PermissionMod
     const {
       BypassPermissionsModeDialog
     } = await import('./components/BypassPermissionsModeDialog.js');
+    anyScreenShown = true;
     await showSetupDialog(root, done => <BypassPermissionsModeDialog onAccept={done} />);
   }
   if (feature('TRANSCRIPT_CLASSIFIER')) {
@@ -230,6 +251,7 @@ export async function showSetupScreens(root: Root, permissionMode: PermissionMod
       const {
         AutoModeOptInDialog
       } = await import('./components/AutoModeOptInDialog.js');
+      anyScreenShown = true;
       await showSetupDialog(root, done => <AutoModeOptInDialog onAccept={done} onDecline={() => gracefulShutdownSync(1)} declineExits />);
     }
   }
@@ -273,6 +295,7 @@ export async function showSetupScreens(root: Root, permissionMode: PermissionMod
         const {
           DevChannelsDialog
         } = await import('./components/DevChannelsDialog.js');
+        anyScreenShown = true;
         await showSetupDialog(root, done => <DevChannelsDialog channels={devChannels} onAccept={() => {
           // Mark dev entries per-entry so the allowlist bypass doesn't leak
           // to --channels entries when both flags are passed.
@@ -292,9 +315,13 @@ export async function showSetupScreens(root: Root, permissionMode: PermissionMod
     const {
       ClaudeInChromeOnboarding
     } = await import('./components/ClaudeInChromeOnboarding.js');
+    anyScreenShown = true;
     await showSetupDialog(root, done => <ClaudeInChromeOnboarding onDone={done} />);
   }
-  return onboardingShown;
+  return {
+    onboardingShown,
+    anyScreenShown
+  };
 }
 export function getRenderContext(exitOnCtrlC: boolean): {
   renderOptions: RenderOptions;

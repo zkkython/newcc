@@ -242,10 +242,23 @@ export function usePasteHandler({
     // When the user pastes an image with Cmd+V, the terminal sends an empty
     // bracketed paste sequence. The keypress parser emits this as isPasted=true
     // with empty input.
-    if (isFromPaste && input.length === 0 && isMacOS && onImagePaste) {
+    if (
+      isFromPaste &&
+      !key.return &&
+      input.length === 0 &&
+      isMacOS &&
+      onImagePaste
+    ) {
       checkClipboardForImage()
       // Reset isPasting since there's no text content to process
       setIsPasting(false)
+      return
+    }
+
+    // Never route Enter through paste handling. Some terminals can
+    // transiently/stale-mark Enter as pasted, which swallows submit.
+    if (key.return) {
+      onInput(input, key)
       return
     }
 
@@ -255,7 +268,7 @@ export function usePasteHandler({
       (input.length > PASTE_THRESHOLD ||
         pastePendingRef.current ||
         hasImageFilePath ||
-        isFromPaste)
+        (isFromPaste && !key.return))
 
     if (shouldHandleAsPaste) {
       pastePendingRef.current = true

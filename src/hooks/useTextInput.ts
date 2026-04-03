@@ -20,6 +20,7 @@ import {
 } from '../utils/Cursor.js'
 import { env } from '../utils/env.js'
 import { isFullscreenEnvEnabled } from '../utils/fullscreen.js'
+import { logForDebugging } from '../utils/debug.js'
 import type { ImageDimensions } from '../utils/imageResizer.js'
 import { isModifierPressed, prewarmModifiers } from '../utils/modifiers.js'
 import { useDoublePress } from './useDoublePress.js'
@@ -252,17 +253,23 @@ export function useTextInput({
     ) {
       // Track that the user has used backslash+return
       markBackslashReturnUsed()
+      logForDebugging('[useTextInput] handleEnter: backslash-return => newline')
       return cursor.backspace().insert('\n')
     }
     // Meta+Enter or Shift+Enter inserts a newline
     if (key.meta || key.shift) {
+      logForDebugging('[useTextInput] handleEnter: meta/shift+enter => newline')
       return cursor.insert('\n')
     }
     // Apple Terminal doesn't support custom Shift+Enter keybindings,
     // so we use native macOS modifier detection to check if Shift is held
     if (env.terminal === 'Apple_Terminal' && isModifierPressed('shift')) {
+      logForDebugging(
+        '[useTextInput] handleEnter: Apple_Terminal shift modifier => newline',
+      )
       return cursor.insert('\n')
     }
+    logForDebugging('[useTextInput] handleEnter: submit')
     onSubmit?.(originalValue)
   }
 
@@ -472,6 +479,28 @@ export function useTextInput({
     // Reset yank state for non-yank keys (breaks yank-pop chain)
     if (!isYankKey(key, filteredInput)) {
       resetYankState()
+    }
+
+    // Bun on some terminals can emit Enter as raw "\r"/"\n" without setting
+    // key.return. Treat lone CR/LF as Enter so submission still works.
+    const isRawEnterWithoutKeyFlag =
+      !key.return &&
+      !key.ctrl &&
+      filteredInput.length === 1 &&
+      (filteredInput === '\r' || filteredInput === '\n')
+
+    if (isRawEnterWithoutKeyFlag) {
+      logForDebugging(
+        `[useTextInput] raw enter fallback: input=${JSON.stringify(filteredInput)} ctrl=${key.ctrl} return=${key.return}`,
+      )
+      const nextCursor = handleEnter(key)
+      if (nextCursor && !cursor.equals(nextCursor)) {
+        if (cursor.text !== nextCursor.text) {
+          onChange(nextCursor.text)
+        }
+        setOffset(nextCursor.offset)
+      }
+      return
     }
 
     const nextCursor = mapKey(key)(filteredInput)

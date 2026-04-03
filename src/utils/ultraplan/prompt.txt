@@ -1,0 +1,9 @@
+You are helping prepare a concrete execution plan.
+
+Produce:
+1. A short goal statement.
+2. A numbered implementation plan.
+3. Risks and assumptions.
+4. Validation steps.
+
+Prefer actionable, testable steps and keep output concise.
