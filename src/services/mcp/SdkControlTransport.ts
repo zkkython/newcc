@@ -59,6 +59,7 @@ export type SendMcpMessageCallback = (
  */
 export class SdkControlClientTransport implements Transport {
   private isClosed = false
+  private isStarted = false
 
   onclose?: () => void
   onerror?: (error: Error) => void
@@ -69,15 +70,31 @@ export class SdkControlClientTransport implements Transport {
     private sendMcpMessage: SendMcpMessageCallback,
   ) {}
 
-  async start(): Promise<void> {}
+  async start(): Promise<void> {
+    if (this.isClosed) {
+      throw new Error('Transport is closed')
+    }
+    this.isStarted = true
+  }
 
   async send(message: JSONRPCMessage): Promise<void> {
     if (this.isClosed) {
       throw new Error('Transport is closed')
     }
+    if (!this.isStarted) {
+      throw new Error('Transport has not been started')
+    }
 
     // Send the message and wait for the response
-    const response = await this.sendMcpMessage(this.serverName, message)
+    let response: JSONRPCMessage
+    try {
+      response = await this.sendMcpMessage(this.serverName, message)
+    } catch (error) {
+      this.onerror?.(
+        error instanceof Error ? error : new Error(String(error)),
+      )
+      throw error
+    }
 
     // Pass the response back to the MCP client
     if (this.onmessage) {
@@ -108,6 +125,7 @@ export class SdkControlClientTransport implements Transport {
  */
 export class SdkControlServerTransport implements Transport {
   private isClosed = false
+  private isStarted = false
 
   constructor(private sendMcpMessage: (message: JSONRPCMessage) => void) {}
 
@@ -115,15 +133,30 @@ export class SdkControlServerTransport implements Transport {
   onerror?: (error: Error) => void
   onmessage?: (message: JSONRPCMessage) => void
 
-  async start(): Promise<void> {}
+  async start(): Promise<void> {
+    if (this.isClosed) {
+      throw new Error('Transport is closed')
+    }
+    this.isStarted = true
+  }
 
   async send(message: JSONRPCMessage): Promise<void> {
     if (this.isClosed) {
       throw new Error('Transport is closed')
     }
+    if (!this.isStarted) {
+      throw new Error('Transport has not been started')
+    }
 
     // Simply pass the response back through the callback
-    this.sendMcpMessage(message)
+    try {
+      this.sendMcpMessage(message)
+    } catch (error) {
+      this.onerror?.(
+        error instanceof Error ? error : new Error(String(error)),
+      )
+      throw error
+    }
   }
 
   async close(): Promise<void> {

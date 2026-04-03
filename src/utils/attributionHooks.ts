@@ -1,7 +1,19 @@
+import { getCwd } from './cwd.js'
+import { logForDebugging } from './debug.js'
+import { findCanonicalGitRoot } from './git.js'
+import { installPrepareCommitMsgHook } from './postCommitAttribution.js'
+
 const fileContentCache = new Map<string, string>()
 
 export function registerAttributionHooks(): void {
-  // Reconstructed baseline: keep setup/clear flows callable.
+  const repoRoot = findCanonicalGitRoot(getCwd())
+  if (!repoRoot) return
+  void installPrepareCommitMsgHook(repoRoot).catch(error => {
+    logForDebugging(
+      `[attributionHooks] failed to install prepare-commit-msg hook: ${String(error)}`,
+      { level: 'error' },
+    )
+  })
 }
 
 export function sweepFileContentCache(): void {

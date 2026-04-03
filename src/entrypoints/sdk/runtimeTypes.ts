@@ -31,7 +31,27 @@ export type McpSdkServerConfigWithInstance = {
   instance?: unknown
 }
 
-export type Options = Record<string, unknown>
+export type Options = {
+  cwd?: string
+  model?: string
+  fallbackModel?: string
+  systemPrompt?: string
+  appendSystemPrompt?: string
+  maxTurns?: number
+  maxBudgetUsd?: number
+  taskBudget?: { total: number }
+  replayUserMessages?: boolean
+  includePartialMessages?: boolean
+  verbose?: boolean
+  jsonSchema?: Record<string, unknown>
+  // Internal/runtime-injected objects. Kept as unknown[] here to avoid
+  // pulling large runtime types into the lightweight SDK type surface.
+  commands?: unknown[]
+  tools?: unknown[]
+  mcpClients?: unknown[]
+  canUseTool?: (...args: unknown[]) => Promise<unknown>
+  [key: string]: unknown
+}
 
 export type InternalOptions = Options & {
   includeInternalMetadata?: boolean
@@ -42,6 +62,7 @@ export type Query = AsyncIterable<SDKMessage>
 export type InternalQuery = AsyncIterable<SDKMessage>
 
 export type SessionMutationOptions = {
+  dir?: string
   timeoutMs?: number
   signal?: AbortSignal
 }
@@ -54,10 +75,14 @@ export type ListSessionsOptions = {
   dir?: string
   limit?: number
   offset?: number
+  timeoutMs?: number
+  signal?: AbortSignal
 }
 
 export type GetSessionInfoOptions = {
   dir?: string
+  timeoutMs?: number
+  signal?: AbortSignal
 }
 
 export type GetSessionMessagesOptions = {
@@ -65,9 +90,17 @@ export type GetSessionMessagesOptions = {
   limit?: number
   offset?: number
   includeSystemMessages?: boolean
+  timeoutMs?: number
+  signal?: AbortSignal
 }
 
 export type ForkSessionOptions = {
+  dir?: string
+  upToMessageId?: string
+  title?: string
+  timeoutMs?: number
+  signal?: AbortSignal
+  // Back-compat for earlier reconstruction rounds that nested options.
   options?: Options
 }
 

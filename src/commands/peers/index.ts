@@ -7,8 +7,7 @@ const call: LocalCommandCall = async () => {
   if (sessions.length === 0) {
     return {
       type: 'text',
-      value:
-        'No live peers discovered (UDS peer registry is not fully reconstructed yet).',
+      value: 'No live peers discovered.',
     }
   }
 

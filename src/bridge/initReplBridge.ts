@@ -71,6 +71,7 @@ import type { BridgeState, ReplBridgeHandle } from './replBridge.js'
 import { initBridgeCore } from './replBridge.js'
 import { setCseShimGate } from './sessionIdCompat.js'
 import type { BridgeWorkerType } from './types.js'
+import type { CodeSessionBridgeOptions } from './codeSessionApi.js'
 
 export type InitBridgeOptions = {
   onInboundMessage?: (msg: SDKMessage) => void | Promise<void>
@@ -105,6 +106,7 @@ export type InitBridgeOptions = {
    */
   outboundOnly?: boolean
   tags?: string[]
+  bridgeOptions?: CodeSessionBridgeOptions
 }
 
 export async function initReplBridge(
@@ -125,6 +127,7 @@ export async function initReplBridge(
     perpetual,
     outboundOnly,
     tags,
+    bridgeOptions,
   } = options ?? {}
 
   // Wire the cse_ shim kill switch so toCompatSessionId respects the
@@ -448,6 +451,7 @@ export async function initReplBridge(
       onStateChange,
       outboundOnly,
       tags,
+      bridgeOptions,
     })
   }
 

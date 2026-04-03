@@ -1,5 +1,44 @@
 import { feature } from 'bun:bundle';
 
+type RuntimeMacro = {
+  VERSION: string
+  BUILD_TIME: string
+  PACKAGE_URL: string
+  NATIVE_PACKAGE_URL: string
+  FEEDBACK_CHANNEL: string
+  ISSUES_EXPLAINER: string
+  VERSION_CHANGELOG: string
+}
+
+function initRuntimeMacro(): RuntimeMacro {
+  const defaults: RuntimeMacro = {
+    VERSION: '9.9.9',
+    BUILD_TIME: '',
+    PACKAGE_URL: '@anthropic-ai/claude-code',
+    NATIVE_PACKAGE_URL: '@anthropic-ai/claude-code-native',
+    FEEDBACK_CHANNEL: 'https://github.com/anthropics/claude-code/issues',
+    ISSUES_EXPLAINER: 'open an issue on GitHub',
+    VERSION_CHANGELOG: '',
+  }
+  const existing = (globalThis as { MACRO?: Partial<RuntimeMacro> }).MACRO ?? {}
+  const macro: RuntimeMacro = { ...defaults, ...existing }
+  ;(globalThis as { MACRO?: RuntimeMacro }).MACRO = macro
+  try {
+    // Create a real global var binding so bare `MACRO` identifiers used across
+    // modules resolve in source-run mode (build-time define replacement absent).
+    ;(0, eval)('var MACRO = globalThis.MACRO')
+  } catch {
+    // ignore
+  }
+  return macro
+}
+
+const RUNTIME_MACRO = initRuntimeMacro()
+
+const BUILD_VERSION =
+  RUNTIME_MACRO.VERSION ??
+  '9.9.9';
+
 // Bugfix for corepack auto-pinning, which adds yarnpkg to peoples' package.jsons
 // eslint-disable-next-line custom-rules/no-top-level-side-effects
 process.env.COREPACK_ENABLE_AUTO_PIN = '0';
@@ -37,7 +76,7 @@ async function main(): Promise<void> {
   if (args.length === 1 && (args[0] === '--version' || args[0] === '-v' || args[0] === '-V')) {
     // MACRO.VERSION is inlined at build time
     // biome-ignore lint/suspicious/noConsole:: intentional console output
-    console.log(`${MACRO.VERSION} (Claude Code)`);
+    console.log(`${BUILD_VERSION} (Claude Code)`);
     return;
   }
 

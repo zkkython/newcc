@@ -439,6 +439,17 @@ export class FirstPartyEventLoggingExporter implements LogRecordExporter {
       ? ` (${this.lastExportErrorContext})`
       : ''
     const message = `1P event logging: ${events.length} events failed to export${context}`
+    // 401/403 and explicit bad-request rejects are expected in some proxy/org
+    // setups; keep them visible in debug logs without polluting ERROR output.
+    if (
+      context.includes('status=401') ||
+      context.includes('status=403') ||
+      context.includes('code=ERR_BAD_REQUEST') ||
+      context.includes('code=FailedToOpenSocket')
+    ) {
+      logForDebugging(message, { level: 'warn' })
+      return
+    }
     logError(new Error(message))
   }
 

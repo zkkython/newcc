@@ -30,9 +30,25 @@ export function parseConnectUrl(ccUrl: string): {
   }
 
   if (parsed.protocol === 'cc+unix:') {
-    throw new Error(
-      'cc+unix:// direct-connect is not supported in reconstructed mode yet',
-    )
+    const encodedSocketPath = `${parsed.hostname}${parsed.pathname}`.trim()
+    if (!encodedSocketPath) {
+      throw new Error(`Invalid cc+unix:// URL: missing socket path in ${ccUrl}`)
+    }
+    let socketPath: string
+    try {
+      socketPath = decodeURIComponent(encodedSocketPath)
+    } catch {
+      throw new Error(`Invalid cc+unix:// URL: bad encoded socket path`)
+    }
+    if (!socketPath.startsWith('/')) {
+      throw new Error(
+        `Invalid cc+unix:// URL: socket path must be absolute (${socketPath})`,
+      )
+    }
+    return {
+      serverUrl: normalizeServerUrl(`unix:${socketPath}`),
+      authToken,
+    }
   }
 
   throw new Error(`Unsupported connect URL scheme: ${parsed.protocol}`)

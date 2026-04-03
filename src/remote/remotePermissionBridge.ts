@@ -68,9 +68,16 @@ export function createToolStub(toolName: string): Tool {
         })
         .join(', ')
     },
-    call: async () => ({ data: '' }),
-    description: async () => '',
-    prompt: () => '',
+    call: async (input: Record<string, unknown>) => ({
+      data:
+        `Remote tool "${toolName}" is not loaded locally.\n` +
+        `This stub only supports permission rendering in the local client.\n` +
+        `Input preview: ${jsonStringify(input).slice(0, 500)}`,
+    }),
+    description: async () =>
+      `Stub for remote-only tool "${toolName}" used for permission bridging.`,
+    prompt: () =>
+      `This is a local stub for remote tool "${toolName}". It is non-executable in local mode.`,
     isReadOnly: () => false,
     isMcp: false,
     needsPermissions: () => true,

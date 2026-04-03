@@ -13,9 +13,34 @@ import type {
   CallToolResult,
   ToolAnnotations,
 } from '@modelcontextprotocol/sdk/types.js'
+import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs'
 import { randomUUID } from 'crypto'
 import { appendFile, readFile, writeFile } from 'fs/promises'
+import { hostname } from 'os'
 import { dirname, join } from 'path'
+import { ask } from '../QueryEngine.js'
+import {
+  query as queryImpl,
+  type QueryParams as InternalQueryParams,
+} from '../query.js'
+import { getCommands } from '../commands.js'
+import {
+  archiveBridgeSession,
+  createBridgeSession,
+} from '../bridge/createSession.js'
+import { initBridgeCore } from '../bridge/replBridge.js'
+import { createStore } from '../state/store.js'
+import { getDefaultAppState, type AppState } from '../state/AppStateStore.js'
+import { getTools } from '../tools.js'
+import type { Message } from '../types/message.js'
+import { getCwd } from '../utils/cwd.js'
+import {
+  createFileStateCacheWithSizeLimit,
+  READ_FILE_STATE_CACHE_SIZE,
+  type FileStateCache,
+} from '../utils/fileStateCache.js'
+import type { CanUseToolFn } from '../hooks/useCanUseTool.js'
+import { hasPermissionsToUseTool } from '../utils/permissions/permissions.js'
 import {
   buildMissedTaskNotification as buildMissedTaskNotificationImpl,
   createCronScheduler,
@@ -139,6 +164,175 @@ export function createSdkMcpServer(
 
 export class AbortError extends Error {}
 
+type PromptSessionContext = {
+  mutableMessages: Message[]
+  readFileCache: FileStateCache
+  appStateStore: ReturnType<typeof createStore<AppState>>
+}
+
+const promptSessionContexts = new Map<string, PromptSessionContext>()
+
+function createPromptSessionContext(): PromptSessionContext {
+  return {
+    mutableMessages: [],
+    readFileCache: createFileStateCacheWithSizeLimit(READ_FILE_STATE_CACHE_SIZE),
+    appStateStore: createStore(getDefaultAppState()),
+  }
+}
+
+function getPromptSessionContext(sessionId?: string): PromptSessionContext {
+  if (!sessionId) return createPromptSessionContext()
+  const existing = promptSessionContexts.get(sessionId)
+  if (existing) return existing
+  const created = createPromptSessionContext()
+  promptSessionContexts.set(sessionId, created)
+  return created
+}
+
+function normalizePromptContent(
+  value: unknown,
+): string | ContentBlockParam[] | null {
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) return value as ContentBlockParam[]
+  return null
+}
+
+async function withAbortAndTimeout<T>(
+  fn: () => Promise<T>,
+  opts?: { timeoutMs?: number; signal?: AbortSignal },
+): Promise<T> {
+  const { timeoutMs, signal } = opts ?? {}
+  if (!timeoutMs && !signal) return fn()
+
+  return await new Promise<T>((resolve, reject) => {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    let done = false
+
+    const finish = (runner: () => void) => {
+      if (done) return
+      done = true
+      if (timeout) clearTimeout(timeout)
+      if (signal) signal.removeEventListener('abort', onAbort)
+      runner()
+    }
+
+    const onAbort = () =>
+      finish(() =>
+        reject(
+          new AbortError(
+            signal?.reason instanceof Error
+              ? signal.reason.message
+              : 'Operation aborted',
+          ),
+        ),
+      )
+
+    if (signal?.aborted) {
+      onAbort()
+      return
+    }
+    if (signal) signal.addEventListener('abort', onAbort, { once: true })
+    if (timeoutMs && timeoutMs > 0) {
+      timeout = setTimeout(
+        () => finish(() => reject(new Error(`Operation timed out after ${timeoutMs}ms`))),
+        timeoutMs,
+      )
+    }
+
+    fn().then(
+      value => finish(() => resolve(value)),
+      error => finish(() => reject(error)),
+    )
+  })
+}
+
+async function* runPromptQuery(
+  prompt: string | AsyncIterable<SDKUserMessage>,
+  options?: Options,
+  sessionId?: string,
+): Query {
+  const opts = (options ?? {}) as Record<string, unknown>
+  const context = getPromptSessionContext(sessionId)
+  const cwd = typeof opts.cwd === 'string' ? opts.cwd : getCwd()
+
+  const commands = Array.isArray(opts.commands)
+    ? (opts.commands as Awaited<ReturnType<typeof getCommands>>)
+    : await getCommands(cwd)
+  const tools = Array.isArray(opts.tools)
+    ? (opts.tools as ReturnType<typeof getTools>)
+    : getTools(context.appStateStore.getState().toolPermissionContext)
+  const canUseTool =
+    (typeof opts.canUseTool === 'function'
+      ? (opts.canUseTool as CanUseToolFn)
+      : hasPermissionsToUseTool) ?? hasPermissionsToUseTool
+  const mcpClients = Array.isArray(opts.mcpClients)
+    ? (opts.mcpClients as AppState['mcp']['clients'])
+    : context.appStateStore.getState().mcp.clients
+
+  const prompts: Array<{
+    content: string | ContentBlockParam[]
+    uuid?: string
+    isMeta?: boolean
+  }> = []
+  if (typeof prompt === 'string') {
+    prompts.push({ content: prompt })
+  } else {
+    for await (const userMessage of prompt) {
+      const content = normalizePromptContent(userMessage.message?.content)
+      if (!content) continue
+      prompts.push({
+        content,
+        uuid: userMessage.uuid,
+        isMeta: userMessage.isSynthetic,
+      })
+    }
+  }
+
+  for (const item of prompts) {
+    yield* ask({
+      commands,
+      prompt: item.content,
+      promptUuid: item.uuid,
+      isMeta: item.isMeta,
+      cwd,
+      tools,
+      mcpClients,
+      canUseTool,
+      mutableMessages: context.mutableMessages,
+      getReadFileCache: () => context.readFileCache,
+      setReadFileCache: cache => {
+        context.readFileCache = cache
+      },
+      getAppState: context.appStateStore.getState,
+      setAppState: context.appStateStore.setState,
+      userSpecifiedModel:
+        typeof opts.model === 'string' ? opts.model : undefined,
+      fallbackModel:
+        typeof opts.fallbackModel === 'string' ? opts.fallbackModel : undefined,
+      customSystemPrompt:
+        typeof opts.systemPrompt === 'string' ? opts.systemPrompt : undefined,
+      appendSystemPrompt:
+        typeof opts.appendSystemPrompt === 'string'
+          ? opts.appendSystemPrompt
+          : undefined,
+      maxTurns: typeof opts.maxTurns === 'number' ? opts.maxTurns : undefined,
+      maxBudgetUsd:
+        typeof opts.maxBudgetUsd === 'number' ? opts.maxBudgetUsd : undefined,
+      taskBudget:
+        typeof opts.taskBudget === 'object' && opts.taskBudget
+          ? (opts.taskBudget as { total: number })
+          : undefined,
+      replayUserMessages: Boolean(opts.replayUserMessages),
+      includePartialMessages: Boolean(opts.includePartialMessages),
+      verbose: Boolean(opts.verbose),
+      jsonSchema:
+        typeof opts.jsonSchema === 'object' && opts.jsonSchema
+          ? (opts.jsonSchema as Record<string, unknown>)
+          : undefined,
+    })
+  }
+}
+
 /** @internal */
 export function query(_params: {
   prompt: string | AsyncIterable<SDKUserMessage>
@@ -148,30 +342,35 @@ export function query(_params: {
   prompt: string | AsyncIterable<SDKUserMessage>
   options?: Options
 }): Query
+export function query(params: InternalQueryParams): ReturnType<typeof queryImpl>
 export function query(params?: {
   prompt: string | AsyncIterable<SDKUserMessage>
   options?: Options
-}): Query {
-  return (async function* () {
-    if (params?.prompt && typeof params.prompt !== 'string') {
-      for await (const userMsg of params.prompt) {
-        yield userMsg as SDKMessage
-      }
-    } else if (typeof params?.prompt === 'string') {
-      yield {
-        type: 'user',
-        message: {
-          role: 'user',
-          content: params.prompt,
-        },
-        parent_tool_use_id: null,
-      } as SDKMessage
-    }
-    yield buildResultMessage(
-      'error_during_execution',
-      ['query() runtime is unavailable in this reconstructed SDK build'],
-    ) as SDKMessage
-  })()
+} | InternalQueryParams): Query | ReturnType<typeof queryImpl> {
+  if (
+    params &&
+    typeof params === 'object' &&
+    'messages' in params &&
+    'systemPrompt' in params &&
+    'toolUseContext' in params
+  ) {
+    return queryImpl(params as InternalQueryParams)
+  }
+  const promptParam =
+    params &&
+    typeof params === 'object' &&
+    'prompt' in params &&
+    params.prompt !== undefined
+      ? params.prompt
+      : ''
+  const promptOptions =
+    params && typeof params === 'object' && 'options' in params
+      ? params.options
+      : undefined
+  return runPromptQuery(
+    promptParam as string | AsyncIterable<SDKUserMessage>,
+    promptOptions,
+  )
 }
 
 function buildResultMessage(
@@ -224,17 +423,15 @@ function createSessionObject(
   return {
     id: sessionId,
     query(params: { prompt: string }): Query {
-      return query({
-        prompt: params.prompt,
-        options: options.options ?? {},
-      })
+      return runPromptQuery(params.prompt, options.options ?? {}, sessionId)
     },
     async prompt(message: string): Promise<SDKResultMessage> {
       let last: SDKResultMessage | null = null
-      for await (const msg of query({
-        prompt: message,
-        options: options.options ?? {},
-      })) {
+      for await (const msg of runPromptQuery(
+        message,
+        options.options ?? {},
+        sessionId,
+      )) {
         if (msg.type === 'result') {
           last = msg as SDKResultMessage
         }
@@ -313,62 +510,69 @@ export async function getSessionMessages(
   sessionId: string,
   options?: GetSessionMessagesOptions,
 ): Promise<SessionMessage[]> {
-  const resolved = await resolveSessionFilePath(sessionId, options?.dir)
-  if (!resolved) return []
+  return withAbortAndTimeout(async () => {
+    const resolved = await resolveSessionFilePath(sessionId, options?.dir)
+    if (!resolved) return []
 
-  const content = await readFile(resolved.filePath, 'utf8').catch(() => '')
-  if (!content) return []
+    const content = await readFile(resolved.filePath, 'utf8').catch(() => '')
+    if (!content) return []
 
-  const allEntries = parseJSONL<Entry>(content)
-  const transcript = allEntries.filter(
-    (entry): entry is Entry & { uuid: string; parentUuid: string | null } =>
-      typeof entry === 'object' &&
-      entry !== null &&
-      'uuid' in entry &&
-      'parentUuid' in entry &&
-      (entry as { isSidechain?: boolean }).isSidechain !== true,
-  )
-  if (transcript.length === 0) return []
+    const allEntries = parseJSONL<Entry>(content)
+    const transcript = allEntries.filter(
+      (entry): entry is Entry & { uuid: string; parentUuid: string | null } =>
+        typeof entry === 'object' &&
+        entry !== null &&
+        'uuid' in entry &&
+        'parentUuid' in entry &&
+        (entry as { isSidechain?: boolean }).isSidechain !== true,
+    )
+    if (transcript.length === 0) return []
 
-  const byUuid = new Map(
-    transcript
-      .map(m => [m.uuid, m] as const)
-      .filter(([uuid]) => typeof uuid === 'string'),
-  )
-  const leaf = transcript.reduce((latest, cur) => {
-    const latestTs = Date.parse((latest as { timestamp?: string }).timestamp ?? '')
-    const curTs = Date.parse((cur as { timestamp?: string }).timestamp ?? '')
-    if (!Number.isNaN(curTs) && (Number.isNaN(latestTs) || curTs > latestTs)) {
-      return cur
+    const byUuid = new Map(
+      transcript
+        .map(m => [m.uuid, m] as const)
+        .filter(([uuid]) => typeof uuid === 'string'),
+    )
+    const leaf = transcript.reduce((latest, cur) => {
+      const latestTs = Date.parse(
+        (latest as { timestamp?: string }).timestamp ?? '',
+      )
+      const curTs = Date.parse((cur as { timestamp?: string }).timestamp ?? '')
+      if (
+        !Number.isNaN(curTs) &&
+        (Number.isNaN(latestTs) || curTs > latestTs)
+      ) {
+        return cur
+      }
+      return latest
+    }, transcript[transcript.length - 1]!)
+
+    const chain: SessionMessage[] = []
+    const seen = new Set<string>()
+    let cur: (typeof transcript)[number] | undefined = leaf
+    while (cur && !seen.has(cur.uuid)) {
+      seen.add(cur.uuid)
+      const type = (cur as { type?: string }).type
+      if (
+        type === 'user' ||
+        type === 'assistant' ||
+        (options?.includeSystemMessages && type === 'system')
+      ) {
+        chain.push({
+          ...(cur as Record<string, unknown>),
+          session_id: (cur as { sessionId?: string }).sessionId ?? sessionId,
+        } as SessionMessage)
+      }
+      const parentUuid = (cur as { parentUuid?: string | null }).parentUuid
+      cur = typeof parentUuid === 'string' ? byUuid.get(parentUuid) : undefined
     }
-    return latest
-  }, transcript[transcript.length - 1]!)
 
-  const chain: SessionMessage[] = []
-  const seen = new Set<string>()
-  let cur: (typeof transcript)[number] | undefined = leaf
-  while (cur && !seen.has(cur.uuid)) {
-    seen.add(cur.uuid)
-    const type = (cur as { type?: string }).type
-    if (
-      type === 'user' ||
-      type === 'assistant' ||
-      (options?.includeSystemMessages && type === 'system')
-    ) {
-      chain.push({
-        ...(cur as Record<string, unknown>),
-        session_id: (cur as { sessionId?: string }).sessionId ?? sessionId,
-      } as SessionMessage)
-    }
-    const parentUuid = (cur as { parentUuid?: string | null }).parentUuid
-    cur =
-      typeof parentUuid === 'string' ? byUuid.get(parentUuid) : undefined
-  }
-
-  chain.reverse()
-  const offset = Math.max(0, options?.offset ?? 0)
-  const limit = options?.limit && options.limit > 0 ? options.limit : undefined
-  return limit ? chain.slice(offset, offset + limit) : chain.slice(offset)
+    chain.reverse()
+    const offset = Math.max(0, options?.offset ?? 0)
+    const limit =
+      options?.limit && options.limit > 0 ? options.limit : undefined
+    return limit ? chain.slice(offset, offset + limit) : chain.slice(offset)
+  }, options)
 }
 
 /**
@@ -393,7 +597,10 @@ export async function getSessionMessages(
 export async function listSessions(
   options?: ListSessionsOptions,
 ): Promise<SDKSessionInfo[]> {
-  return (await listSessionsImpl(options)) as SDKSessionInfo[]
+  return withAbortAndTimeout(
+    async () => (await listSessionsImpl(options)) as SDKSessionInfo[],
+    options,
+  )
 }
 
 /**
@@ -409,13 +616,16 @@ export async function getSessionInfo(
   sessionId: string,
   options?: GetSessionInfoOptions,
 ): Promise<SDKSessionInfo | undefined> {
-  const resolved = await resolveSessionFilePath(sessionId, options?.dir)
-  if (!resolved) return undefined
-  const lite = await readSessionLite(resolved.filePath)
-  if (!lite) return undefined
-  return (
-    parseSessionInfoFromLite(sessionId, lite, resolved.projectPath) ?? undefined
-  ) as SDKSessionInfo | undefined
+  return withAbortAndTimeout(async () => {
+    const resolved = await resolveSessionFilePath(sessionId, options?.dir)
+    if (!resolved) return undefined
+    const lite = await readSessionLite(resolved.filePath)
+    if (!lite) return undefined
+    return (
+      parseSessionInfoFromLite(sessionId, lite, resolved.projectPath) ??
+      undefined
+    ) as SDKSessionInfo | undefined
+  }, options)
 }
 
 /**
@@ -427,17 +637,19 @@ export async function getSessionInfo(
 export async function renameSession(
   sessionId: string,
   title: string,
-  _options?: SessionMutationOptions,
+  options?: SessionMutationOptions,
 ): Promise<void> {
-  const resolved = await resolveSessionFilePath(sessionId)
-  if (!resolved) {
-    throw new Error(`Session not found: ${sessionId}`)
-  }
-  await appendJsonlEntry(resolved.filePath, {
-    type: 'custom-title',
-    sessionId,
-    customTitle: title,
-  })
+  await withAbortAndTimeout(async () => {
+    const resolved = await resolveSessionFilePath(sessionId, options?.dir)
+    if (!resolved) {
+      throw new Error(`Session not found: ${sessionId}`)
+    }
+    await appendJsonlEntry(resolved.filePath, {
+      type: 'custom-title',
+      sessionId,
+      customTitle: title,
+    })
+  }, options)
 }
 
 /**
@@ -449,17 +661,19 @@ export async function renameSession(
 export async function tagSession(
   sessionId: string,
   tag: string | null,
-  _options?: SessionMutationOptions,
+  options?: SessionMutationOptions,
 ): Promise<void> {
-  const resolved = await resolveSessionFilePath(sessionId)
-  if (!resolved) {
-    throw new Error(`Session not found: ${sessionId}`)
-  }
-  await appendJsonlEntry(resolved.filePath, {
-    type: 'tag',
-    sessionId,
-    tag: tag ?? '',
-  })
+  await withAbortAndTimeout(async () => {
+    const resolved = await resolveSessionFilePath(sessionId, options?.dir)
+    if (!resolved) {
+      throw new Error(`Session not found: ${sessionId}`)
+    }
+    await appendJsonlEntry(resolved.filePath, {
+      type: 'tag',
+      sessionId,
+      tag: tag ?? '',
+    })
+  }, options)
 }
 
 /**
@@ -480,69 +694,86 @@ export async function forkSession(
   sessionId: string,
   options?: ForkSessionOptions,
 ): Promise<ForkSessionResult> {
-  const resolved = await resolveSessionFilePath(sessionId)
-  if (!resolved) {
-    throw new Error(`Session not found: ${sessionId}`)
-  }
+  return withAbortAndTimeout(async () => {
+    const resolved = await resolveSessionFilePath(sessionId, options?.dir)
+    if (!resolved) {
+      throw new Error(`Session not found: ${sessionId}`)
+    }
 
-  const original = await readFile(resolved.filePath, 'utf8')
-  const entries = parseJSONL<Entry>(original)
-  const forkSessionId = randomUUID()
-  const uuidMap = new Map<string, string>()
+    const original = await readFile(resolved.filePath, 'utf8')
+    const entries = parseJSONL<Entry>(original)
+    const forkSessionId = randomUUID()
+    const uuidMap = new Map<string, string>()
+    const translated: unknown[] = []
+    const upToMessageId = options?.upToMessageId
+    let hitUpToMessageId = false
 
-  const translated = entries.map(entry => {
-    if (
-      typeof entry === 'object' &&
-      entry !== null &&
-      'uuid' in entry &&
-      typeof (entry as { uuid?: unknown }).uuid === 'string'
-    ) {
-      const current = entry as Record<string, unknown>
-      const oldUuid = current.uuid as string
-      const newUuid = uuidMap.get(oldUuid) ?? randomUUID()
-      uuidMap.set(oldUuid, newUuid)
-      const parent = current.parentUuid
-      return {
-        ...current,
-        uuid: newUuid,
-        parentUuid:
-          typeof parent === 'string' ? (uuidMap.get(parent) ?? null) : null,
-        sessionId: forkSessionId,
-        isSidechain: false,
-        forkedFrom: { sessionId, messageUuid: oldUuid },
+    for (const entry of entries) {
+      if (
+        typeof entry === 'object' &&
+        entry !== null &&
+        'uuid' in entry &&
+        typeof (entry as { uuid?: unknown }).uuid === 'string'
+      ) {
+        const current = entry as Record<string, unknown>
+        const oldUuid = current.uuid as string
+        const newUuid = uuidMap.get(oldUuid) ?? randomUUID()
+        uuidMap.set(oldUuid, newUuid)
+        const parent = current.parentUuid
+        translated.push({
+          ...current,
+          uuid: newUuid,
+          parentUuid:
+            typeof parent === 'string' ? (uuidMap.get(parent) ?? null) : null,
+          sessionId: forkSessionId,
+          isSidechain: false,
+          forkedFrom: { sessionId, messageUuid: oldUuid },
+        })
+        if (upToMessageId && oldUuid === upToMessageId) {
+          hitUpToMessageId = true
+          break
+        }
+        continue
+      }
+      if (typeof entry === 'object' && entry !== null && 'sessionId' in entry) {
+        translated.push({
+          ...(entry as Record<string, unknown>),
+          sessionId: forkSessionId,
+        })
+      } else {
+        translated.push(entry)
       }
     }
-    if (
-      typeof entry === 'object' &&
-      entry !== null &&
-      'sessionId' in entry
-    ) {
-      return {
-        ...(entry as Record<string, unknown>),
-        sessionId: forkSessionId,
-      }
+
+    if (upToMessageId && !hitUpToMessageId) {
+      throw new Error(`Message not found in session: ${upToMessageId}`)
     }
-    return entry
-  })
 
-  const outputPath = join(dirname(resolved.filePath), `${forkSessionId}.jsonl`)
-  const data =
-    translated
-      .map(item => JSON.stringify(item))
-      .join('\n')
-      .concat('\n')
-  await writeFile(outputPath, data, { encoding: 'utf8', mode: 0o600 })
+    const outputPath = join(
+      dirname(resolved.filePath),
+      `${forkSessionId}.jsonl`,
+    )
+    const data =
+      translated
+        .map(item => JSON.stringify(item))
+        .join('\n')
+        .concat('\n')
+    await writeFile(outputPath, data, { encoding: 'utf8', mode: 0o600 })
 
-  const requestedTitle = (options?.options as { title?: unknown } | undefined)
-    ?.title
-  if (typeof requestedTitle === 'string' && requestedTitle.trim().length > 0) {
-    await appendJsonlEntry(outputPath, {
-      type: 'custom-title',
-      sessionId: forkSessionId,
-      customTitle: requestedTitle,
-    })
-  }
-  return { sessionId: forkSessionId }
+    const requestedTitle =
+      options?.title ??
+      ((options?.options as { title?: unknown } | undefined)?.title as
+        | string
+        | undefined)
+    if (typeof requestedTitle === 'string' && requestedTitle.trim().length > 0) {
+      await appendJsonlEntry(outputPath, {
+        type: 'custom-title',
+        sessionId: forkSessionId,
+        customTitle: requestedTitle,
+      })
+    }
+    return { sessionId: forkSessionId }
+  }, options)
 }
 
 // ============================================================================
@@ -761,9 +992,140 @@ export type RemoteControlHandle = {
  * @internal
  */
 export async function connectRemoteControl(
-  _opts: ConnectRemoteControlOptions,
+  opts: ConnectRemoteControlOptions,
 ): Promise<RemoteControlHandle | null> {
-  return null
+  type Queue<T> = {
+    push(value: T): void
+    end(): void
+    stream(): AsyncGenerator<T>
+  }
+  function createQueue<T>(): Queue<T> {
+    const values: T[] = []
+    const waiters: Array<(value: T | null) => void> = []
+    let ended = false
+    return {
+      push(value: T) {
+        if (ended) return
+        const waiter = waiters.shift()
+        if (waiter) waiter(value)
+        else values.push(value)
+      },
+      end() {
+        if (ended) return
+        ended = true
+        while (waiters.length > 0) {
+          waiters.shift()?.(null)
+        }
+      },
+      async *stream() {
+        while (true) {
+          if (values.length > 0) {
+            yield values.shift() as T
+            continue
+          }
+          if (ended) break
+          const next = await new Promise<T | null>(resolve => waiters.push(resolve))
+          if (next === null) break
+          yield next
+        }
+      },
+    }
+  }
+
+  const inboundPromptQueue = createQueue<InboundPrompt>()
+  const controlRequestQueue = createQueue<unknown>()
+  const permissionResponseQueue = createQueue<unknown>()
+  const stateListeners = new Set<
+    (state: 'ready' | 'connected' | 'reconnecting' | 'failed', detail?: string) => void
+  >()
+
+  const handle = await initBridgeCore({
+    dir: opts.dir,
+    machineName: hostname(),
+    branch: opts.branch ?? '',
+    gitRepoUrl: opts.gitRepoUrl ?? null,
+    title: opts.name ?? `remote-control-${randomUUID().slice(0, 8)}`,
+    baseUrl: opts.baseUrl,
+    sessionIngressUrl: opts.baseUrl,
+    workerType: opts.workerType ?? 'claude_code',
+    getAccessToken: opts.getAccessToken,
+    createSession: createOpts =>
+      createBridgeSession({
+        ...createOpts,
+        events: [],
+        baseUrl: opts.baseUrl,
+        getAccessToken: opts.getAccessToken,
+      }),
+    archiveSession: async sessionId => {
+      await archiveBridgeSession(sessionId, {
+        baseUrl: opts.baseUrl,
+        getAccessToken: opts.getAccessToken,
+      }).catch(() => {})
+    },
+    onInboundMessage: msg => {
+      if (msg.type === 'user') {
+        inboundPromptQueue.push({
+          content: msg.message.content,
+          uuid: msg.uuid,
+        })
+      }
+    },
+    onPermissionResponse: response => {
+      permissionResponseQueue.push(response)
+    },
+    onInterrupt: () => {
+      controlRequestQueue.push({ type: 'interrupt' })
+    },
+    onSetModel: model => {
+      controlRequestQueue.push({ type: 'set_model', model })
+    },
+    onStateChange: (state, detail) => {
+      for (const listener of stateListeners) {
+        listener(state, detail)
+      }
+    },
+  })
+  if (!handle) return null
+
+  return {
+    sessionUrl: `${opts.baseUrl}/v1/sessions/${handle.bridgeSessionId}`,
+    environmentId: handle.environmentId,
+    bridgeSessionId: handle.bridgeSessionId,
+    write(msg: SDKMessage) {
+      handle.writeSdkMessages([msg])
+    },
+    sendResult() {
+      handle.sendResult()
+    },
+    sendControlRequest(req: unknown) {
+      handle.sendControlRequest(req as never)
+    },
+    sendControlResponse(res: unknown) {
+      handle.sendControlResponse(res as never)
+    },
+    sendControlCancelRequest(requestId: string) {
+      handle.sendControlCancelRequest(requestId)
+    },
+    inboundPrompts() {
+      return inboundPromptQueue.stream()
+    },
+    controlRequests() {
+      return controlRequestQueue.stream()
+    },
+    permissionResponses() {
+      return permissionResponseQueue.stream()
+    },
+    onStateChange(cb) {
+      stateListeners.add(cb)
+    },
+    async teardown() {
+      inboundPromptQueue.end()
+      controlRequestQueue.end()
+      permissionResponseQueue.end()
+      stateListeners.clear()
+      await handle.teardown()
+    },
+  }
 }
 
 async function appendJsonlEntry(

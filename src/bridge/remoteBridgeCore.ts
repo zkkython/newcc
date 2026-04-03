@@ -86,6 +86,71 @@ function oauthHeaders(accessToken: string): Record<string, string> {
   }
 }
 
+function shouldAttemptAuthRefresh(
+  failure: CodeSessionFailure | undefined,
+): boolean {
+  if (!failure) return false
+  if (failure.kind === 'network') return true
+  if (failure.kind !== 'http') return false
+  return failure.status === 401 || failure.status === 403
+}
+
+function formatInitFailureDetail(
+  failure: CodeSessionFailure | undefined,
+): string | undefined {
+  if (!failure) return undefined
+  if (failure.kind === 'http') {
+    if (failure.status === 401 || failure.status === 403) {
+      return 'authentication failed (/login may be required)'
+    }
+    return `HTTP ${failure.status ?? 'error'}${failure.detail ? `: ${failure.detail}` : ''}`
+  }
+  if (failure.kind === 'network') {
+    return `network error${failure.detail ? `: ${failure.detail}` : ''}`
+  }
+  return `response schema mismatch${failure.detail ? `: ${failure.detail}` : ''}`
+}
+
+function logBridgeRefreshFailure(
+  cause: Exclude<ConnectCause, 'initial'>,
+  failure: CodeSessionFailure | undefined,
+): void {
+  if (!failure) return
+  logEvent('tengu_bridge_repl_v2_refresh_stage_failed', {
+    cause: cause as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+    stage:
+      failure.stage as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+    kind:
+      failure.kind as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+    status: failure.status,
+  })
+  logForDebugging(
+    `[remote-bridge] refresh failure cause=${cause} kind=${failure.kind} status=${failure.status ?? 'n/a'} detail=${failure.detail ?? 'n/a'}`,
+  )
+}
+
+function shouldRetryInitFailure(
+  failure: CodeSessionFailure | undefined,
+): boolean {
+  if (!failure) return true
+  if (failure.kind === 'schema') return false
+  if (failure.kind === 'network') return true
+  const status = failure.status
+  if (status === undefined) return true
+  if (
+    status === 401 ||
+    status === 403 ||
+    status === 408 ||
+    status === 409 ||
+    status === 425 ||
+    status === 429
+  ) {
+    return true
+  }
+  if (status >= 500) return true
+  return false
+}
+
 export type EnvLessBridgeParams = {
   baseUrl: string
   orgUUID: string
@@ -128,6 +193,8 @@ export type EnvLessBridgeParams = {
   outboundOnly?: boolean
   /** Free-form tags for session categorization (e.g. ['ccr-mirror']). */
   tags?: string[]
+  /** Optional payload forwarded as `bridge` in POST /v1/code/sessions. */
+  bridgeOptions?: CodeSessionBridgeOptions
 }
 
 /**
@@ -159,25 +226,87 @@ export async function initEnvLessBridgeCore(
     onStateChange,
     outboundOnly,
     tags,
+    bridgeOptions,
   } = params
 
   const cfg = await getEnvLessBridgeConfig()
 
   // ── 1. Create session (POST /v1/code/sessions, no env_id) ───────────────
-  const accessToken = getAccessToken()
-  if (!accessToken) {
+  const initialAccessToken = getAccessToken()
+  if (!initialAccessToken) {
     logForDebugging('[remote-bridge] No OAuth token')
     return null
   }
 
+  let createSessionRefreshTried = false
+  let lastCreateSessionFailure: CodeSessionFailure | undefined
   const createdSessionId = await withRetry(
-    () =>
-      createCodeSession(baseUrl, accessToken, title, cfg.http_timeout_ms, tags),
+    async () => {
+      lastCreateSessionFailure = undefined
+      const token = getAccessToken() ?? initialAccessToken
+      const created = await createCodeSession(
+        baseUrl,
+        token,
+        title,
+        cfg.http_timeout_ms,
+        tags,
+        bridgeOptions,
+        failure => {
+          lastCreateSessionFailure = failure
+        },
+      )
+      if (created !== null) return created
+
+      // Refresh only on likely auth-related failures.
+      if (
+        onAuth401 &&
+        !createSessionRefreshTried &&
+        shouldAttemptAuthRefresh(lastCreateSessionFailure)
+      ) {
+        createSessionRefreshTried = true
+        await onAuth401(token)
+        const refreshed = getAccessToken()
+        if (refreshed && refreshed !== token) {
+          return createCodeSession(
+            baseUrl,
+            refreshed,
+            title,
+            cfg.http_timeout_ms,
+            tags,
+            bridgeOptions,
+            failure => {
+              lastCreateSessionFailure = failure
+            },
+          )
+        }
+      }
+      return null
+    },
     'createCodeSession',
     cfg,
+    {
+      shouldRetry: () => shouldRetryInitFailure(lastCreateSessionFailure),
+    },
   )
   if (!createdSessionId) {
-    onStateChange?.('failed', 'Session creation failed — see debug log')
+    if (lastCreateSessionFailure) {
+      logEvent('tengu_bridge_repl_v2_init_stage_failed', {
+        stage:
+          lastCreateSessionFailure.stage as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        kind:
+          lastCreateSessionFailure.kind as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        status: lastCreateSessionFailure.status,
+        refresh_attempted: createSessionRefreshTried,
+      })
+      logForDebugging(
+        `[remote-bridge] create_session failure kind=${lastCreateSessionFailure.kind} status=${lastCreateSessionFailure.status ?? 'n/a'} detail=${lastCreateSessionFailure.detail ?? 'n/a'}`,
+      )
+    }
+    onStateChange?.(
+      'failed',
+      formatInitFailureDetail(lastCreateSessionFailure) ??
+        'Session creation failed — see debug log',
+    )
     logBridgeSkip('v2_session_create_failed', undefined, true)
     return null
   }
@@ -186,24 +315,76 @@ export async function initEnvLessBridgeCore(
   logForDiagnosticsNoPII('info', 'bridge_repl_v2_session_created')
 
   // ── 2. Fetch bridge credentials (POST /bridge → worker_jwt, expires_in, api_base_url) ──
+  let fetchCredsRefreshTried = false
+  let lastFetchCredsFailure: CodeSessionFailure | undefined
   const credentials = await withRetry(
-    () =>
-      fetchRemoteCredentials(
+    async () => {
+      lastFetchCredsFailure = undefined
+      const token = getAccessToken() ?? initialAccessToken
+      const creds = await fetchRemoteCredentials(
         sessionId,
         baseUrl,
-        accessToken,
+        token,
         cfg.http_timeout_ms,
-      ),
+        failure => {
+          lastFetchCredsFailure = failure
+        },
+      )
+      if (creds !== null) return creds
+
+      // Refresh only on likely auth-related failures.
+      if (
+        onAuth401 &&
+        !fetchCredsRefreshTried &&
+        shouldAttemptAuthRefresh(lastFetchCredsFailure)
+      ) {
+        fetchCredsRefreshTried = true
+        await onAuth401(token)
+        const refreshed = getAccessToken()
+        if (refreshed && refreshed !== token) {
+          return fetchRemoteCredentials(
+            sessionId,
+            baseUrl,
+            refreshed,
+            cfg.http_timeout_ms,
+            failure => {
+              lastFetchCredsFailure = failure
+            },
+          )
+        }
+      }
+      return null
+    },
     'fetchRemoteCredentials',
     cfg,
+    {
+      shouldRetry: () => shouldRetryInitFailure(lastFetchCredsFailure),
+    },
   )
   if (!credentials) {
-    onStateChange?.('failed', 'Remote credentials fetch failed — see debug log')
+    if (lastFetchCredsFailure) {
+      logEvent('tengu_bridge_repl_v2_init_stage_failed', {
+        stage:
+          lastFetchCredsFailure.stage as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        kind:
+          lastFetchCredsFailure.kind as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        status: lastFetchCredsFailure.status,
+        refresh_attempted: fetchCredsRefreshTried,
+      })
+      logForDebugging(
+        `[remote-bridge] fetch_bridge_credentials failure kind=${lastFetchCredsFailure.kind} status=${lastFetchCredsFailure.status ?? 'n/a'} detail=${lastFetchCredsFailure.detail ?? 'n/a'}`,
+      )
+    }
+    onStateChange?.(
+      'failed',
+      formatInitFailureDetail(lastFetchCredsFailure) ??
+        'Remote credentials fetch failed — see debug log',
+    )
     logBridgeSkip('v2_remote_creds_failed', undefined, true)
     void archiveSession(
       sessionId,
       baseUrl,
-      accessToken,
+      getAccessToken() ?? initialAccessToken,
       orgUUID,
       cfg.http_timeout_ms,
     )
@@ -244,7 +425,7 @@ export async function initEnvLessBridgeCore(
     void archiveSession(
       sessionId,
       baseUrl,
-      accessToken,
+      getAccessToken() ?? initialAccessToken,
       orgUUID,
       cfg.http_timeout_ms,
     )
@@ -339,6 +520,7 @@ export async function initEnvLessBridgeCore(
         }
         authRecoveryInFlight = true
         try {
+          let lastProactiveRefreshFailure: CodeSessionFailure | undefined
           const fresh = await withRetry(
             () =>
               fetchRemoteCredentials(
@@ -346,11 +528,26 @@ export async function initEnvLessBridgeCore(
                 baseUrl,
                 oauthToken,
                 cfg.http_timeout_ms,
+                failure => {
+                  lastProactiveRefreshFailure = failure
+                },
               ),
             'fetchRemoteCredentials (proactive)',
             cfg,
+            {
+              shouldRetry: () =>
+                shouldRetryInitFailure(lastProactiveRefreshFailure),
+            },
           )
-          if (!fresh || tornDown) return
+          if (!fresh || tornDown) {
+            if (!tornDown) {
+              logBridgeRefreshFailure(
+                'proactive_refresh',
+                lastProactiveRefreshFailure,
+              )
+            }
+            return
+          }
           await rebuildTransport(fresh, 'proactive_refresh')
           logForDebugging(
             '[remote-bridge] Transport rebuilt (proactive refresh)',
@@ -550,6 +747,7 @@ export async function initEnvLessBridgeCore(
         return
       }
 
+      let lastRecoveryFailure: CodeSessionFailure | undefined
       const fresh = await withRetry(
         () =>
           fetchRemoteCredentials(
@@ -557,13 +755,24 @@ export async function initEnvLessBridgeCore(
             baseUrl,
             oauthToken,
             cfg.http_timeout_ms,
+            failure => {
+              lastRecoveryFailure = failure
+            },
           ),
         'fetchRemoteCredentials (recovery)',
         cfg,
+        {
+          shouldRetry: () => shouldRetryInitFailure(lastRecoveryFailure),
+        },
       )
       if (!fresh || tornDown) {
         if (!tornDown) {
-          onStateChange?.('failed', 'JWT refresh failed after 401')
+          logBridgeRefreshFailure('auth_401_recovery', lastRecoveryFailure)
+          onStateChange?.(
+            'failed',
+            formatInitFailureDetail(lastRecoveryFailure) ??
+              'JWT refresh failed after 401',
+          )
         }
         return
       }
@@ -893,21 +1102,45 @@ async function withRetry<T>(
   fn: () => Promise<T | null>,
   label: string,
   cfg: EnvLessBridgeConfig,
+  opts: { shouldRetry?: () => boolean } = {},
 ): Promise<T | null> {
   const max = cfg.init_retry_max_attempts
+  let lastError: unknown
   for (let attempt = 1; attempt <= max; attempt++) {
-    const result = await fn()
+    let result: T | null = null
+    try {
+      result = await fn()
+    } catch (error) {
+      lastError = error
+      logForDebugging(
+        `[remote-bridge] ${label} threw (attempt ${attempt}/${max}): ${errorMessage(error)}`,
+      )
+    }
     if (result !== null) return result
+    if (attempt < max && opts.shouldRetry && !opts.shouldRetry()) {
+      logForDebugging(
+        `[remote-bridge] ${label} not retryable after attempt ${attempt}/${max}; stopping early`,
+      )
+      return null
+    }
     if (attempt < max) {
       const base = cfg.init_retry_base_delay_ms * 2 ** (attempt - 1)
       const jitter =
         base * cfg.init_retry_jitter_fraction * (2 * Math.random() - 1)
-      const delay = Math.min(base + jitter, cfg.init_retry_max_delay_ms)
+      const delay = Math.max(
+        0,
+        Math.min(base + jitter, cfg.init_retry_max_delay_ms),
+      )
       logForDebugging(
         `[remote-bridge] ${label} failed (attempt ${attempt}/${max}), retrying in ${Math.round(delay)}ms`,
       )
       await sleep(delay)
     }
+  }
+  if (lastError) {
+    logForDebugging(
+      `[remote-bridge] ${label} exhausted retries; last error: ${errorMessage(lastError)}`,
+    )
   }
   return null
 }
@@ -916,10 +1149,14 @@ async function withRetry<T>(
 // without pulling in this file's heavy CLI tree (analytics, transport).
 export {
   createCodeSession,
+  type CodeSessionBridgeOptions,
+  type CodeSessionFailure,
   type RemoteCredentials,
 } from './codeSessionApi.js'
 import {
   createCodeSession,
+  type CodeSessionBridgeOptions,
+  type CodeSessionFailure,
   fetchRemoteCredentials as fetchRemoteCredentialsRaw,
   type RemoteCredentials,
 } from './codeSessionApi.js'
@@ -933,6 +1170,7 @@ export async function fetchRemoteCredentials(
   baseUrl: string,
   accessToken: string,
   timeoutMs: number,
+  onFailure?: (failure: CodeSessionFailure) => void,
 ): Promise<RemoteCredentials | null> {
   const creds = await fetchRemoteCredentialsRaw(
     sessionId,
@@ -940,6 +1178,7 @@ export async function fetchRemoteCredentials(
     accessToken,
     timeoutMs,
     getTrustedDeviceToken(),
+    onFailure,
   )
   if (!creds) return null
   return getBridgeBaseUrlOverride()

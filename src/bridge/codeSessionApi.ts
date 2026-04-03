@@ -15,6 +15,18 @@ import { extractErrorDetail } from './debugUtils.js'
 
 const ANTHROPIC_VERSION = '2023-06-01'
 
+export type CodeSessionBridgeOptions = Record<string, unknown>
+export type CodeSessionFailureStage =
+  | 'create_session'
+  | 'fetch_bridge_credentials'
+export type CodeSessionFailureKind = 'http' | 'network' | 'schema'
+export type CodeSessionFailure = {
+  stage: CodeSessionFailureStage
+  kind: CodeSessionFailureKind
+  status?: number
+  detail?: string
+}
+
 function oauthHeaders(accessToken: string): Record<string, string> {
   return {
     Authorization: `Bearer ${accessToken}`,
@@ -29,16 +41,24 @@ export async function createCodeSession(
   title: string,
   timeoutMs: number,
   tags?: string[],
+  bridgeOptions?: CodeSessionBridgeOptions,
+  onFailure?: (failure: CodeSessionFailure) => void,
 ): Promise<string | null> {
   const url = `${baseUrl}/v1/code/sessions`
   let response
+  const bridgePayload =
+    bridgeOptions &&
+    typeof bridgeOptions === 'object' &&
+    !Array.isArray(bridgeOptions)
+      ? bridgeOptions
+      : {}
   try {
     response = await axios.post(
       url,
       // bridge: {} is the positive signal for the oneof runner — omitting it
       // (or sending environment_id: "") now 400s. BridgeRunner is an empty
       // message today; it's a placeholder for future bridge-specific options.
-      { title, bridge: {}, ...(tags?.length ? { tags } : {}) },
+      { title, bridge: bridgePayload, ...(tags?.length ? { tags } : {}) },
       {
         headers: oauthHeaders(accessToken),
         timeout: timeoutMs,
@@ -49,6 +69,11 @@ export async function createCodeSession(
     logForDebugging(
       `[code-session] Session create request failed: ${errorMessage(err)}`,
     )
+    onFailure?.({
+      stage: 'create_session',
+      kind: 'network',
+      detail: errorMessage(err),
+    })
     return null
   }
 
@@ -57,6 +82,12 @@ export async function createCodeSession(
     logForDebugging(
       `[code-session] Session create failed ${response.status}${detail ? `: ${detail}` : ''}`,
     )
+    onFailure?.({
+      stage: 'create_session',
+      kind: 'http',
+      status: response.status,
+      detail,
+    })
     return null
   }
 
@@ -74,6 +105,11 @@ export async function createCodeSession(
     logForDebugging(
       `[code-session] No session.id (cse_*) in response: ${jsonStringify(data).slice(0, 200)}`,
     )
+    onFailure?.({
+      stage: 'create_session',
+      kind: 'schema',
+      detail: 'missing session.id cse_* in response',
+    })
     return null
   }
   return data.session.id
@@ -96,6 +132,7 @@ export async function fetchRemoteCredentials(
   accessToken: string,
   timeoutMs: number,
   trustedDeviceToken?: string,
+  onFailure?: (failure: CodeSessionFailure) => void,
 ): Promise<RemoteCredentials | null> {
   const url = `${baseUrl}/v1/code/sessions/${sessionId}/bridge`
   const headers = oauthHeaders(accessToken)
@@ -117,6 +154,11 @@ export async function fetchRemoteCredentials(
     logForDebugging(
       `[code-session] /bridge request failed: ${errorMessage(err)}`,
     )
+    onFailure?.({
+      stage: 'fetch_bridge_credentials',
+      kind: 'network',
+      detail: errorMessage(err),
+    })
     return null
   }
 
@@ -125,6 +167,12 @@ export async function fetchRemoteCredentials(
     logForDebugging(
       `[code-session] /bridge failed ${response.status}${detail ? `: ${detail}` : ''}`,
     )
+    onFailure?.({
+      stage: 'fetch_bridge_credentials',
+      kind: 'http',
+      status: response.status,
+      detail,
+    })
     return null
   }
 
@@ -135,7 +183,6 @@ export async function fetchRemoteCredentials(
     !('worker_jwt' in data) ||
     typeof data.worker_jwt !== 'string' ||
     !('expires_in' in data) ||
-    typeof data.expires_in !== 'number' ||
     !('api_base_url' in data) ||
     typeof data.api_base_url !== 'string' ||
     !('worker_epoch' in data)
@@ -143,26 +190,42 @@ export async function fetchRemoteCredentials(
     logForDebugging(
       `[code-session] /bridge response malformed (need worker_jwt, expires_in, api_base_url, worker_epoch): ${jsonStringify(data).slice(0, 200)}`,
     )
+    onFailure?.({
+      stage: 'fetch_bridge_credentials',
+      kind: 'schema',
+      detail: 'malformed /bridge response envelope',
+    })
     return null
   }
   // protojson serializes int64 as a string to avoid JS precision loss;
   // Go may also return a number depending on encoder settings.
   const rawEpoch = data.worker_epoch
   const epoch = typeof rawEpoch === 'string' ? Number(rawEpoch) : rawEpoch
+  const rawExpiresIn = data.expires_in
+  const expiresIn =
+    typeof rawExpiresIn === 'string' ? Number(rawExpiresIn) : rawExpiresIn
   if (
     typeof epoch !== 'number' ||
     !Number.isFinite(epoch) ||
-    !Number.isSafeInteger(epoch)
+    !Number.isSafeInteger(epoch) ||
+    typeof expiresIn !== 'number' ||
+    !Number.isFinite(expiresIn) ||
+    expiresIn <= 0
   ) {
     logForDebugging(
-      `[code-session] /bridge worker_epoch invalid: ${jsonStringify(rawEpoch)}`,
+      `[code-session] /bridge response invalid epoch/expires_in: epoch=${jsonStringify(rawEpoch)} expires_in=${jsonStringify(rawExpiresIn)}`,
     )
+    onFailure?.({
+      stage: 'fetch_bridge_credentials',
+      kind: 'schema',
+      detail: 'invalid worker_epoch/expires_in',
+    })
     return null
   }
   return {
     worker_jwt: data.worker_jwt,
     api_base_url: data.api_base_url,
-    expires_in: data.expires_in,
+    expires_in: expiresIn,
     worker_epoch: epoch,
   }
 }

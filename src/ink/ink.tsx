@@ -5,7 +5,7 @@ import throttle from 'lodash-es/throttle.js';
 import React, { type ReactNode } from 'react';
 import type { FiberRoot } from 'react-reconciler';
 import { ConcurrentRoot } from 'react-reconciler/constants.js';
-import { onExit } from 'signal-exit';
+import { onExit } from 'src/utils/signalExitCompat.js';
 import { flushInteractionTime } from 'src/bootstrap/state.js';
 import { getYogaCounters } from 'src/native-ts/yoga-layout/index.js';
 import { logForDebugging } from 'src/utils/debug.js';

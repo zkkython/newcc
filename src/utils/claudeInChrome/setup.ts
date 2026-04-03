@@ -1,5 +1,5 @@
-import { BROWSER_TOOLS } from '@ant/claude-for-chrome-mcp'
 import { chmod, mkdir, readFile, writeFile } from 'fs/promises'
+import { createRequire } from 'module'
 import { homedir } from 'os'
 import { join } from 'path'
 import { fileURLToPath } from 'url'
@@ -30,6 +30,21 @@ import {
 } from './common.js'
 import { getChromeSystemPrompt } from './prompt.js'
 import { isChromeExtensionInstalledPortable } from './setupPortable.js'
+
+type BrowserToolShape = { name: string }
+
+function getBrowserTools(): BrowserToolShape[] {
+  try {
+    const req = createRequire(import.meta.url)
+    const mod = req('@ant/claude-for-chrome-mcp') as {
+      BROWSER_TOOLS?: BrowserToolShape[]
+    }
+    return Array.isArray(mod.BROWSER_TOOLS) ? mod.BROWSER_TOOLS : []
+  } catch {
+    // External/public builds don't have this internal package.
+    return []
+  }
+}
 
 const CHROME_EXTENSION_RECONNECT_URL = 'https://clau.de/chrome/reconnect'
 
@@ -94,7 +109,7 @@ export function setupClaudeInChrome(): {
   systemPrompt: string
 } {
   const isNativeBuild = isInBundledMode()
-  const allowedTools = BROWSER_TOOLS.map(
+  const allowedTools = getBrowserTools().map(
     tool => `mcp__claude-in-chrome__${tool.name}`,
   )
 

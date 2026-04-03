@@ -1,6 +1,7 @@
 /* eslint-disable eslint-plugin-n/no-unsupported-features/node-builtins */
 
 import { randomUUID } from 'crypto'
+import { request } from 'http'
 import type { SDKMessage } from '../entrypoints/agentSdkTypes.js'
 import type {
   SDKControlPermissionRequest,
@@ -164,68 +165,121 @@ export class DirectConnectSessionManager {
     })
   }
 
-  private stringifyContent(content: RemoteMessageContent): string {
-    if (typeof content === 'string') return content
-    if (Array.isArray(content)) {
-      const text = content
-        .map(block => {
-          if (typeof block === 'string') return block
-          if (typeof block === 'object' && block && 'text' in block) {
-            return String((block as { text?: unknown }).text ?? '')
-          }
-          return ''
-        })
-        .join('\n')
-        .trim()
-      return text || '(non-text content)'
+  private async postMessagesHttp(
+    content: RemoteMessageContent,
+  ): Promise<SDKMessage[]> {
+    const path = `/sessions/${this.config.sessionId}/messages`
+    const payload = jsonStringify({
+      prompt: content,
+    })
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
     }
-    return '(unsupported content)'
+    if (this.config.authToken) {
+      headers.authorization = `Bearer ${this.config.authToken}`
+    }
+
+    if (this.config.serverUrl.startsWith('unix:')) {
+      const socketPath = this.config.serverUrl.slice('unix:'.length)
+      return await new Promise<SDKMessage[]>((resolve, reject) => {
+        const req = request(
+          {
+            socketPath,
+            path,
+            method: 'POST',
+            headers: {
+              ...headers,
+              'content-length': Buffer.byteLength(payload).toString(),
+            },
+          },
+          res => {
+            const chunks: Buffer[] = []
+            res.on('data', chunk =>
+              chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)),
+            )
+            res.on('end', () => {
+              const raw = Buffer.concat(chunks).toString('utf8')
+              let parsed: unknown
+              try {
+                parsed = raw.trim() ? jsonParse(raw) : {}
+              } catch {
+                reject(new Error(`Invalid JSON response: ${raw}`))
+                return
+              }
+              if ((res.statusCode ?? 500) >= 400) {
+                reject(
+                  new Error(
+                    `HTTP ${(res.statusCode ?? 500).toString()} ${res.statusMessage ?? ''}`.trim(),
+                  ),
+                )
+                return
+              }
+              const messages = Array.isArray((parsed as { messages?: unknown }).messages)
+                ? ((parsed as { messages: SDKMessage[] }).messages ?? [])
+                : []
+              resolve(messages)
+            })
+          },
+        )
+        req.on('error', reject)
+        req.write(payload)
+        req.end()
+      })
+    }
+
+    const response = await fetch(`${this.config.serverUrl}${path}`, {
+      method: 'POST',
+      headers,
+      body: payload,
+    })
+    if (!response.ok) {
+      throw new Error(
+        `HTTP ${response.status.toString()} ${response.statusText}`.trim(),
+      )
+    }
+    const parsed = (await response.json()) as { messages?: SDKMessage[] }
+    return Array.isArray(parsed.messages) ? parsed.messages : []
   }
 
-  sendMessage(content: RemoteMessageContent): boolean {
-    if (this.fallbackMode) {
-      const text = this.stringifyContent(content)
-      const assistant = {
-        type: 'assistant',
-        uuid: randomUUID(),
-        message: {
-          id: randomUUID(),
-          type: 'message',
-          role: 'assistant',
-          content: [
-            {
-              type: 'text',
-              text: `[direct-connect reconstructed] ${text}`,
-            },
-          ],
-          model: 'claude-reconstructed-direct-connect',
-          stop_reason: 'end_turn',
-          stop_sequence: null,
+  private sendMessageViaHttpFallback(content: RemoteMessageContent): void {
+    void this.postMessagesHttp(content)
+      .then(messages => {
+        for (const message of messages) {
+          this.callbacks.onMessage(message)
+        }
+      })
+      .catch(error => {
+        logForDebugging(
+          `[DirectConnect] HTTP fallback message submission failed: ${error instanceof Error ? error.message : String(error)}`,
+        )
+        const result = {
+          type: 'result',
+          subtype: 'error_during_execution',
+          uuid: randomUUID(),
+          duration_ms: 0,
+          duration_api_ms: 0,
+          is_error: true,
+          num_turns: 1,
+          session_id: this.config.sessionId,
+          total_cost_usd: 0,
           usage: {
             input_tokens: 0,
             output_tokens: 0,
           },
-        },
-      } as SDKMessage
-      this.callbacks.onMessage(assistant)
+          result:
+            error instanceof Error
+              ? error.message
+              : 'HTTP fallback message submission failed',
+        } as SDKMessage
+        this.callbacks.onMessage(result)
+      })
+  }
 
-      const result = {
-        type: 'result',
-        subtype: 'success',
-        uuid: randomUUID(),
-        duration_ms: 0,
-        duration_api_ms: 0,
-        is_error: false,
-        num_turns: 1,
-        result: 'ok',
-        session_id: this.config.sessionId,
-        total_cost_usd: 0,
-        usage: {
-          input_tokens: 0,
-          output_tokens: 0,
-        },
-      } as SDKMessage
-      this.callbacks.onMessage(result)
+  sendMessage(content: RemoteMessageContent): boolean {
+    if (this.fallbackMode) {
+      // Fallback mode preserves a usable direct-connect loop by posting prompts
+      // through the server's HTTP endpoint when WS transport is unavailable.
+      this.sendMessageViaHttpFallback(content)
       return true
     }
 

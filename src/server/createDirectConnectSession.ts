@@ -1,5 +1,6 @@
 /* eslint-disable eslint-plugin-n/no-unsupported-features/node-builtins */
 
+import { request } from 'http'
 import { errorMessage } from '../utils/errors.js'
 import { jsonStringify } from '../utils/slowOperations.js'
 import type { DirectConnectConfig } from './directConnectManager.js'
@@ -44,31 +45,59 @@ export async function createDirectConnectSession({
     headers['authorization'] = `Bearer ${authToken}`
   }
 
-  let resp: Response
-  try {
-    resp = await fetch(`${serverUrl}/sessions`, {
-      method: 'POST',
-      headers,
-      body: jsonStringify({
-        cwd,
-        ...(dangerouslySkipPermissions && {
-          dangerously_skip_permissions: true,
-        }),
-      }),
-    })
-  } catch (err) {
+  const payload = jsonStringify({
+    cwd,
+    ...(dangerouslySkipPermissions && {
+      dangerously_skip_permissions: true,
+    }),
+  })
+
+  let statusCode: number
+  let statusText: string
+  let body: unknown
+
+  if (serverUrl.startsWith('unix:')) {
+    const socketPath = serverUrl.slice('unix:'.length)
+    try {
+      const resp = await postJsonOverUnixSocket({
+        socketPath,
+        path: '/sessions',
+        headers,
+        body: payload,
+      })
+      statusCode = resp.statusCode
+      statusText = resp.statusText
+      body = resp.body
+    } catch (err) {
+      throw new DirectConnectError(
+        `Failed to connect to unix socket ${socketPath}: ${errorMessage(err)}`,
+      )
+    }
+  } else {
+    let resp: Response
+    try {
+      resp = await fetch(`${serverUrl}/sessions`, {
+        method: 'POST',
+        headers,
+        body: payload,
+      })
+    } catch (err) {
+      throw new DirectConnectError(
+        `Failed to connect to server at ${serverUrl}: ${errorMessage(err)}`,
+      )
+    }
+    statusCode = resp.status
+    statusText = resp.statusText
+    body = await resp.json()
+  }
+
+  if (statusCode < 200 || statusCode >= 300) {
     throw new DirectConnectError(
-      `Failed to connect to server at ${serverUrl}: ${errorMessage(err)}`,
+      `Failed to create session: ${statusCode} ${statusText}`,
     )
   }
 
-  if (!resp.ok) {
-    throw new DirectConnectError(
-      `Failed to create session: ${resp.status} ${resp.statusText}`,
-    )
-  }
-
-  const result = connectResponseSchema().safeParse(await resp.json())
+  const result = connectResponseSchema().safeParse(body)
   if (!result.success) {
     throw new DirectConnectError(
       `Invalid session response: ${result.error.message}`,
@@ -85,4 +114,60 @@ export async function createDirectConnectSession({
     },
     workDir: data.work_dir,
   }
+}
+
+async function postJsonOverUnixSocket({
+  socketPath,
+  path,
+  headers,
+  body,
+}: {
+  socketPath: string
+  path: string
+  headers: Record<string, string>
+  body: string
+}): Promise<{
+  statusCode: number
+  statusText: string
+  body: unknown
+}> {
+  return await new Promise((resolve, reject) => {
+    const req = request(
+      {
+        socketPath,
+        path,
+        method: 'POST',
+        headers: {
+          ...headers,
+          'content-length': Buffer.byteLength(body).toString(),
+        },
+      },
+      res => {
+        const chunks: Buffer[] = []
+        res.on('data', chunk =>
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)),
+        )
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8').trim()
+          let parsed: unknown = {}
+          if (raw.length > 0) {
+            try {
+              parsed = JSON.parse(raw)
+            } catch {
+              reject(new Error(`Invalid JSON response from server: ${raw}`))
+              return
+            }
+          }
+          resolve({
+            statusCode: res.statusCode ?? 0,
+            statusText: res.statusMessage ?? '',
+            body: parsed,
+          })
+        })
+      },
+    )
+    req.on('error', reject)
+    req.write(body)
+    req.end()
+  })
 }

@@ -11,6 +11,7 @@ import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js'
 class InProcessTransport implements Transport {
   private peer: InProcessTransport | undefined
   private closed = false
+  private started = false
 
   onclose?: () => void
   onerror?: (error: Error) => void
@@ -21,16 +22,36 @@ class InProcessTransport implements Transport {
     this.peer = peer
   }
 
-  async start(): Promise<void> {}
+  async start(): Promise<void> {
+    if (this.closed) {
+      throw new Error('Transport is closed')
+    }
+    this.started = true
+  }
 
   async send(message: JSONRPCMessage): Promise<void> {
     if (this.closed) {
       throw new Error('Transport is closed')
     }
+    if (!this.started) {
+      throw new Error('Transport has not been started')
+    }
+    if (!this.peer) {
+      throw new Error('Transport peer is not set')
+    }
+    if (!this.peer.started || this.peer.closed) {
+      throw new Error('Transport peer is not ready')
+    }
     // Deliver to the other side asynchronously to avoid stack depth issues
     // with synchronous request/response cycles
     queueMicrotask(() => {
-      this.peer?.onmessage?.(message)
+      try {
+        this.peer?.onmessage?.(message)
+      } catch (error) {
+        this.onerror?.(
+          error instanceof Error ? error : new Error(String(error)),
+        )
+      }
     })
   }
 
