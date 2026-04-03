@@ -36,7 +36,7 @@ Result:
 2. Executable reconstructed client smoke test:
 
 ```bash
-node reconstructed-client/claude-client.mjs --help
+bun src/entrypoints/cli.tsx --help
 ```
 
 Result: CLI usage/help output is returned and executable entrypoint works.

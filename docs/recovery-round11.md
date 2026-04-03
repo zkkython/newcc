@@ -27,6 +27,6 @@ Date: 2026-03-31
   - `unresolvedImportRefs: 0`
   - `unresolvedImportEdges: 0`
   - `unresolvedModuleCount: 0`
-- `node reconstructed-client/claude-client.mjs --help` succeeded.
+- `bun src/entrypoints/cli.tsx --help` succeeded.
 - Recovery stub count (`rg "__recovery_stub" src | wc -l`): `66`
 

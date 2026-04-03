@@ -25,5 +25,5 @@ Rebuild a minimal direct-connect WebSocket server path (`/sessions/:id/ws`) so i
 
 - `node scripts/recovery/scan-missing-imports.mjs`
   - unresolved refs/edges/modules: `0`
-- `node reconstructed-client/claude-client.mjs --help`
+- `bun src/entrypoints/cli.tsx --help`
   - executable help output normal.

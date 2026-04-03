@@ -38,7 +38,7 @@ Filled remaining implementation gaps in `src/entrypoints/agentSdkTypes.ts` so th
 - `node scripts/recovery/scan-missing-imports.mjs`
   - unresolved refs/edges/modules: `0`
 
-- `node reconstructed-client/claude-client.mjs --help`
+- `bun src/entrypoints/cli.tsx --help`
   - executable and prints usage normally.
 
 - `rg -n "not implemented" src`

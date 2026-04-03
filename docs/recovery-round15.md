@@ -19,7 +19,7 @@ Continue reconstruction after stub-zero milestone, focusing on:
 
 - `node scripts/recovery/scan-missing-imports.mjs`
   - unresolved refs/edges/modules all `0`
-- `node reconstructed-client/claude-client.mjs --help` executes successfully
+- `bun src/entrypoints/cli.tsx --help` executes successfully
 - `rg -n "__recovery_stub" src | wc -l` -> `0`
 - `rg -n "Reconstructed placeholder content for" src | wc -l` -> `0`
 

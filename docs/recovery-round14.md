@@ -47,7 +47,7 @@ Continued reconstruction based on `docs/reconstruction-analysis.md`, with focus 
   - `unresolvedImportRefs: 0`
   - `unresolvedImportEdges: 0`
   - `unresolvedModuleCount: 0`
-- `node reconstructed-client/claude-client.mjs --help` executes successfully.
+- `bun src/entrypoints/cli.tsx --help` executes successfully.
 
 ## Current Status
 

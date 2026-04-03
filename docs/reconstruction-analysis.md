@@ -55,28 +55,20 @@ Top affected areas:
 
 ## Reconstruction strategy adopted
 
-Instead of generating hundreds of brittle stubs, this repo now includes a **clean, executable reconstruction client** under `reconstructed-client/`:
-
-- CLI + interactive REPL
-- Claude Messages API integration
-- Tool-calling loop (with user permission prompts)
-- Core filesystem/shell/search tools
-- Session history save/load and command controls
-
-This provides a practical, auditable, runnable "Claude-style" client while preserving this snapshot as a research artifact.
+Instead of maintaining a separate fallback client, reconstruction work is now
+centered directly on the `src/` runtime entrypoint and command surface.
 
 ## Run
 
 ```bash
-cd reconstructed-client
-node claude-client.mjs --help
-ANTHROPIC_API_KEY=... node claude-client.mjs
+bun src/entrypoints/cli.tsx --help
+ANTHROPIC_API_KEY=... bun src/entrypoints/cli.tsx
 ```
 
 ## Progress Update (2026-04-02)
 
 Subsequent recovery rounds have significantly reduced command-surface gaps in
-the `src/` runtime beyond the initial `reconstructed-client/` fallback:
+the `src/` runtime:
 
 - Import graph is now closed (`scan-missing-imports`: unresolved refs/edges/modules = 0).
 - Previously unavailable/placeholder command entries were replaced with runnable

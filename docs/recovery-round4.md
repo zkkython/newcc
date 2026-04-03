@@ -41,7 +41,7 @@ Result:
 2. Reconstructed client smoke:
 
 ```bash
-node reconstructed-client/claude-client.mjs --help
+bun src/entrypoints/cli.tsx --help
 ```
 
 Result: executable help output returned.
